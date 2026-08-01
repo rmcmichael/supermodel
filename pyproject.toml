@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "supermodel"
 version = "0.1.0"
 description = "A lightweight, class-based interface for persisting objects in SQLite."
-readme = "read.md"
+readme = "readme.md"
 requires-python = ">=3.10"
 dependencies = []
 
