@@ -22,6 +22,9 @@ class Database:
         db.path = "app.db"
         db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
         db.execute("INSERT INTO items (name) VALUES (?)", ("alpha",))
+
+    TODO: Consider moving the connection to a dedicated thread with a query queue.
+    TODO: Consider a context manager to allow multiple queries to be committed at once.
     """
 
     _instance = None
