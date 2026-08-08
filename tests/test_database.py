@@ -19,7 +19,6 @@ def test_database_path_property(db):
 
 def test_database_reset(db, tmp_path):
     db.path = str(tmp_path / "test.db")
-    _ = db.connection
     db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
 
     db.reset()
@@ -32,7 +31,7 @@ def test_database_reset(db, tmp_path):
 
 
 def test_path_rejects_change_while_connected(db):
-    _ = db.connection
+    db.execute("SELECT 1")
 
     with pytest.raises(RuntimeError):
         db.path = "other.db"
@@ -46,8 +45,8 @@ def test_path_rejects_change_while_connected(db):
 def test_connection_opens_lazily_and_reuses(db):
     assert db._connection is None
 
-    first = db.connection
-    second = db.connection
+    first = db._ensure_connection()
+    second = db._ensure_connection()
 
     assert isinstance(first, Connection)
     assert first is second
@@ -55,19 +54,17 @@ def test_connection_opens_lazily_and_reuses(db):
 
 
 def test_close_clears_connection(db):
-    conn = db.connection
+    conn = db._ensure_connection()
     db.close()
 
     assert db._connection is None
-    assert conn is not db.connection
+    assert conn is not db._ensure_connection()
 
 
 def test_connection_uses_path(db, tmp_path):
     db_file = tmp_path / "test.db"
     db.path = str(db_file)
-    conn = db.connection
-    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
-    conn.commit()
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
     db.close()
 
     assert db_file.exists()

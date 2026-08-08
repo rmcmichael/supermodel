@@ -61,13 +61,8 @@ class Database:
             raise RuntimeError("Cannot change path while connected; call close() first")
         self._path = path
 
-    @property
-    def connection(self) -> Connection:
-        """Open SQLite connection for ``path``, reusing it if already open.
-
-        Sets ``row_factory`` to :class:`sqlite3.Row` so rows support
-        both index and name access.
-        """
+    def _ensure_connection(self) -> Connection:
+        """Open the SQLite connection for ``path`` if needed, then return it."""
         if self._connection is None:
             self._connection = sqlite3.connect(self._path)
             self._connection.row_factory = Row
@@ -111,14 +106,13 @@ class Database:
             sqlite3.Error: If SQLite rejects the statement.
         """
         try:
-            result = self.connection.execute(
-                sql, () if params is None else params
-            )
-            self.connection.commit()
+            connection = self._ensure_connection()
+            result = connection.execute(sql, () if params is None else params)
+            connection.commit()
             self._last_cursor = result
             return result
         except sqlite3.Error:
-            self.connection.rollback()
+            self._ensure_connection().rollback()
             raise
 
     @property
@@ -142,7 +136,7 @@ class Database:
             table: Table name to look up in ``sqlite_master``.
         """
         stmt = 'SELECT name FROM sqlite_master WHERE type = "table" and name = :table'
-        row = self.connection.execute(stmt, {"table": table}).fetchone()
+        row = self._ensure_connection().execute(stmt, {"table": table}).fetchone()
         return row is not None
 
     def column_exists(self, table: str, column: str) -> bool:
@@ -158,7 +152,7 @@ class Database:
         """
         if not _IDENTIFIER.match(table):
             raise ValueError(f"Invalid table name: {table!r}")
-        result = self.connection.execute(f"PRAGMA table_info({table})")
+        result = self._ensure_connection().execute(f"PRAGMA table_info({table})")
         for row in result:
             if row[1] == column:
                 return True
