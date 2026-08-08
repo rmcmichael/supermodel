@@ -8,21 +8,32 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class Database:
-    """SQLite access for SuperModel.
+    """Process-wide singleton for SQLite access used by SuperModel.
 
-    Not thread-safe: a single shared connection must be used from one thread.
-    A future approach may run database work on a dedicated thread with a query queue.
+    Call ``Database()`` anywhere to get the shared instance. Configure
+    ``path`` before the first connection is opened. Default path is
+    ``":memory:"``.
+
+    Not thread-safe: use from a single thread. A future design may move
+    database work onto a dedicated thread with a query queue.
+
+    Example:
+        db = Database()
+        db.path = "app.db"
+        db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+        db.execute("INSERT INTO items (name) VALUES (?)", ("alpha",))
     """
 
     _instance = None
 
     def __new__(cls):
+        """Return the shared Database instance, creating it if needed."""
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
 
     def __init__(self):
-        """Only initialize once"""
+        """Initialize default state once for the shared instance."""
         if getattr(self, "_initialized", False):
             return
 
@@ -33,7 +44,14 @@ class Database:
 
     @property
     def path(self) -> str:
-        """Path to database file"""
+        """Filesystem path or SQLite URI for the database file.
+
+        Defaults to ``":memory:"``. Cannot be changed while a connection
+        is open; call :meth:`close` first.
+
+        Raises:
+            RuntimeError: If set while a connection is open.
+        """
         return self._path
 
     @path.setter
@@ -45,28 +63,52 @@ class Database:
 
     @property
     def connection(self) -> Connection:
-        """Return a connection to the database.  Open one if necessary."""
+        """Open SQLite connection for ``path``, reusing it if already open.
+
+        Sets ``row_factory`` to :class:`sqlite3.Row` so rows support
+        both index and name access.
+        """
         if self._connection is None:
             self._connection = sqlite3.connect(self._path)
             self._connection.row_factory = Row
         return self._connection
 
-    def close(self):
-        """Close the connection to the database"""
+    def close(self) -> None:
+        """Close the open connection, if any.
+
+        Clears the last cursor used by :attr:`lastrowid` and
+        :attr:`rowcount`. Does not change ``path``.
+        """
         if self._connection is not None:
             self._connection.close()
             self._connection = None
         self._last_cursor = None
 
-    def reset(self):
-        """Close the connection and restore default singleton state."""
+    def reset(self) -> None:
+        """Reset the singleton to defaults.
+
+        Closes any open connection and sets ``path`` back to
+        ``":memory:"``. Useful in tests and for reconfiguration.
+        """
         self.close()
         self._path = ":memory:"
 
     def execute(self, sql: str, params: tuple | dict | None = None) -> Cursor:
-        """Execute a SQL statement and commit. Return the cursor.
+        """Execute SQL, commit, and return the cursor.
 
         Commits after every statement by design (granular commits).
+        On ``sqlite3.Error``, rolls back and re-raises.
+
+        Args:
+            sql: SQL statement to run.
+            params: Positional ``tuple`` or named ``dict`` bind
+                parameters. ``None`` means no parameters.
+
+        Returns:
+            The ``sqlite3.Cursor`` from the statement.
+
+        Raises:
+            sqlite3.Error: If SQLite rejects the statement.
         """
         try:
             result = self.connection.execute(
@@ -81,22 +123,39 @@ class Database:
 
     @property
     def lastrowid(self) -> int | None:
+        """Row id from the last successful :meth:`execute`, if any."""
         if self._last_cursor is None:
             return None
         return self._last_cursor.lastrowid
 
     @property
     def rowcount(self) -> int | None:
+        """Row count from the last successful :meth:`execute`, if any."""
         if self._last_cursor is None:
             return None
         return self._last_cursor.rowcount
 
     def table_exists(self, table: str) -> bool:
+        """Return whether ``table`` exists in the database.
+
+        Args:
+            table: Table name to look up in ``sqlite_master``.
+        """
         stmt = 'SELECT name FROM sqlite_master WHERE type = "table" and name = :table'
         row = self.connection.execute(stmt, {"table": table}).fetchone()
         return row is not None
 
     def column_exists(self, table: str, column: str) -> bool:
+        """Return whether ``column`` exists on ``table``.
+
+        Args:
+            table: Table name. Must be a simple identifier
+                (``[A-Za-z_][A-Za-z0-9_]*``).
+            column: Column name to look for.
+
+        Raises:
+            ValueError: If ``table`` is not a valid identifier.
+        """
         if not _IDENTIFIER.match(table):
             raise ValueError(f"Invalid table name: {table!r}")
         result = self.connection.execute(f"PRAGMA table_info({table})")
