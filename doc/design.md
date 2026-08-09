@@ -146,4 +146,4 @@ Implement against this design in steps. **Each step includes unit tests for that
 2. **Column types** — DONE: DDL fragments and to/from SQL codecs; unit tests for each column type’s DDL and value conversion
 3. **Model core** — DONE: annotations → `_columns`, `__init_subclass__`, identity, `save` / `get` / `remove`; unit tests for persistence and identity rules
 4. **Query and helpers** — DONE: `select`, `count`, `set`, `to_dict`, `from_dict`; unit tests for query/helper behavior
-5. **Package exports** — expose the public API from the package (`Database`, `Model`, `ModelError`, etc.) and add any remaining integration-style tests across slices
+5. **Package exports** — DONE: expose the public API from the package (`Database`, `Model`, `ModelError`, etc.) and add any remaining integration-style tests across slices
