@@ -7,7 +7,7 @@ name = "supermodel"
 version = "0.1.0"
 description = "A lightweight, class-based interface for persisting objects in SQLite."
 readme = "readme.md"
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 dependencies = []
 
 [project.optional-dependencies]
