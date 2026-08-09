@@ -137,6 +137,9 @@ class Database:
 
         Args:
             table: Table name to look up in ``sqlite_master``.
+
+        Returns:
+            True if the table exists in the database, False otherwise
         """
         stmt = 'SELECT name FROM sqlite_master WHERE type = "table" and name = :table'
         row = self._ensure_connection().execute(stmt, {"table": table}).fetchone()
@@ -146,15 +149,18 @@ class Database:
         """Return whether ``column`` exists on ``table``.
 
         Args:
-            table: Table name. Must be a simple identifier
-                (``[A-Za-z_][A-Za-z0-9_]*``).
-            column: Column name to look for.
+            table: Name of the table the column belongs to
+            column: Column name to look for
 
-        Raises:
-            ValueError: If ``table`` is not a valid identifier.
+        Returns:
+            True if the column exists on the table, False otherwise
         """
+
+        # Prevent SQL injection
         if not _IDENTIFIER.match(table):
             raise ValueError(f"Invalid table name: {table!r}")
+
+        # Check if the column exists on the table
         result = self._ensure_connection().execute(f"PRAGMA table_info({table})")
         for row in result:
             if row[1] == column:
