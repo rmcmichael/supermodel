@@ -303,3 +303,198 @@ def test_reserved_id_field_raises(db):
 
         class Bad(Model):
             id: str = ""
+
+
+def test_set_populates_attributes_and_returns_self(db):
+    class Thing(Model):
+        label: str = ""
+        quantity: int = 0
+        note: str | None = None
+
+    thing = Thing()
+    result = thing.set({"label": "alpha", "quantity": 4, "note": None})
+
+    assert result is thing
+    assert thing.label == "alpha"
+    assert thing.quantity == 4
+    assert thing.note is None
+
+
+def test_set_ignores_unknown_keys(db):
+    class Thing(Model):
+        label: str = ""
+
+    thing = Thing().set({"label": "kept", "extra": "ignored"})
+    assert thing.label == "kept"
+    assert not hasattr(thing, "extra")
+
+
+def test_set_save_chain(db):
+    class Thing(Model):
+        label: str = ""
+
+    thing = Thing().set({"label": "chained"}).save()
+    loaded = Thing.get(thing.id)
+    assert loaded.label == "chained"
+
+
+def test_to_dict_returns_python_values(db):
+    class Event(Model):
+        title: str = ""
+        day: date = date(1, 1, 1)
+        at: time = time(0, 0, 0)
+        when: datetime = datetime(1, 1, 1, tzinfo=timezone.utc)
+        ok: bool = False
+        note: str | None = None
+
+    event = Event().set(
+        {
+            "title": "meet",
+            "day": date(2024, 3, 15),
+            "at": time(14, 30, 5, 123456),
+            "when": datetime(2024, 3, 15, 14, 30, 5, 123456, tzinfo=timezone.utc),
+            "ok": True,
+            "note": None,
+        }
+    )
+
+    assert event.to_dict() == {
+        "title": "meet",
+        "day": date(2024, 3, 15),
+        "at": time(14, 30, 5, 123456),
+        "when": datetime(2024, 3, 15, 14, 30, 5, 123456, tzinfo=timezone.utc),
+        "ok": True,
+        "note": None,
+    }
+    assert "id" not in event.to_dict()
+
+
+def test_from_dict_single_saves_and_returns_instance(db):
+    class Thing(Model):
+        label: str = ""
+        quantity: int = 0
+
+    thing = Thing.from_dict({"label": "one", "quantity": 1})
+
+    assert isinstance(thing, Thing)
+    assert thing.id is not None
+    assert thing.label == "one"
+    assert Thing.get(thing.id).quantity == 1
+
+
+def test_from_dict_list_saves_all_and_returns_list(db):
+    class Thing(Model):
+        label: str = ""
+
+    results = Thing.from_dict([{"label": "a"}, {"label": "b"}])
+
+    assert isinstance(results, list)
+    assert len(results) == 2
+    assert [t.label for t in results] == ["a", "b"]
+    assert all(t.id is not None for t in results)
+    assert Thing.count == 2
+
+
+def test_from_dict_list_uses_transaction(db):
+    class Thing(Model):
+        label: str = ""
+
+    Thing._check_schema()
+    original_set = Thing.set
+
+    def failing_set(self, values):
+        if values.get("label") == "b":
+            raise RuntimeError("boom")
+        return original_set(self, values)
+
+    Thing.set = failing_set  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            Thing.from_dict([{"label": "a"}, {"label": "b"}])
+    finally:
+        Thing.set = original_set  # type: ignore[method-assign]
+
+    assert Thing.count == 0
+
+
+def test_count_property(db):
+    class Thing(Model):
+        label: str = ""
+
+    assert Thing.count == 0
+    Thing().set({"label": "a"}).save()
+    Thing().set({"label": "b"}).save()
+    assert Thing.count == 2
+    assert Thing().count == 2
+
+
+def test_select_returns_all_instances(db):
+    class Thing(Model):
+        label: str = ""
+
+    Thing.from_dict([{"label": "a"}, {"label": "b"}])
+    results = Thing.select()
+
+    assert len(results) == 2
+    assert {t.label for t in results} == {"a", "b"}
+
+
+def test_select_order_by_asc_and_desc(db):
+    class Thing(Model):
+        label: str = ""
+        rank: int = 0
+
+    Thing.from_dict(
+        [
+            {"label": "c", "rank": 1},
+            {"label": "a", "rank": 2},
+            {"label": "b", "rank": 2},
+        ]
+    )
+
+    by_label = Thing.select(order_by=["label"])
+    assert [t.label for t in by_label] == ["a", "b", "c"]
+
+    by_rank_desc = Thing.select(order_by=["-rank", "+label"])
+    assert [(t.rank, t.label) for t in by_rank_desc] == [
+        (2, "a"),
+        (2, "b"),
+        (1, "c"),
+    ]
+
+
+def test_select_order_by_unknown_attribute_raises(db):
+    class Thing(Model):
+        label: str = ""
+
+    Thing._check_schema()
+    with pytest.raises(ModelError, match="Unknown attribute"):
+        Thing.select(order_by=["missing"])
+
+
+def test_select_filter_applied_in_python(db):
+    class Thing(Model):
+        label: str = ""
+        active: bool = False
+
+    Thing.from_dict(
+        [
+            {"label": "a", "active": True},
+            {"label": "b", "active": False},
+            {"label": "c", "active": True},
+        ]
+    )
+
+    active = Thing.select(filter=lambda t: t.active)
+    assert [t.label for t in active] == ["a", "c"]
+
+
+def test_select_order_by_uses_column_name_override(db):
+    class Thing(Model):
+        label: str = ""
+
+    Thing.column_name("label", "TITLE")
+    Thing.from_dict([{"label": "b"}, {"label": "a"}])
+
+    results = Thing.select(order_by=["label"])
+    assert [t.label for t in results] == ["a", "b"]

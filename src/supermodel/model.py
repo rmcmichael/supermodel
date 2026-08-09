@@ -8,6 +8,7 @@ import uuid
 from datetime import date
 from datetime import datetime
 from datetime import time
+from collections.abc import Callable
 from typing import Any
 from typing import ClassVar
 from typing import Union
@@ -82,6 +83,18 @@ def _column_for_annotation(annotation: Any) -> Column:
     return column_cls(nullable=nullable)
 
 
+class _CountDescriptor:
+    """Class-level ``Model.count`` property: row count for the model table."""
+
+    def __get__(self, obj: Any, owner: type[Model] | None = None) -> int:
+        if owner is None:
+            raise AttributeError("count")
+        owner._check_schema()
+        table = _quote_ident(owner.table_name)
+        stmt = f"SELECT COUNT(*) AS count FROM {table}"
+        return owner._db.execute(stmt).fetchone()["count"]
+
+
 class Model:
     """Base class for persisted models.
 
@@ -91,7 +104,8 @@ class Model:
 
     Identity uses a read-only ``id`` property backed by private ``_id``.
     ``save()`` inserts (assigning a UUIDv7) when ``id is None``, otherwise
-    updates. ``get`` / ``remove`` load and delete by that id.
+    updates. ``get`` / ``remove`` load and delete by that id. Query helpers
+    include ``select``, ``count``, ``set``, ``to_dict``, and ``from_dict``.
     """
 
     _is_schema_checked: bool = False
@@ -99,6 +113,7 @@ class Model:
     _columns: ClassVar[dict[str, Column]]
     _column_names: ClassVar[dict[str, str]]
     table_name: ClassVar[str]
+    count = _CountDescriptor()
 
     def __init_subclass__(cls, **kwargs) -> None:
         super().__init_subclass__(**kwargs)
@@ -307,3 +322,116 @@ class Model:
             sql_name = type(self)._column_names[attr]
             setattr(self, attr, column.from_sql(row[sql_name]))
         return self
+
+    def set(self, values: dict[str, Any]) -> Model:
+        """Populate persisted attributes from a dict of Python values.
+
+        Only keys that match annotated model fields are applied. Values
+        must already be the correct Python types (no string parsing).
+
+        Args:
+            values: Attribute name → value mapping.
+
+        Returns:
+            ``self`` for fluent chaining.
+        """
+        for attr in type(self)._columns:
+            if attr in values:
+                setattr(self, attr, values[attr])
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return persisted attributes as a dict of Python values.
+
+        Includes annotated model fields only (not ``id``). Values are
+        native Python types (``date``, ``time``, ``datetime``, ``bool``,
+        etc.), not SQL encodings.
+        """
+        return {attr: getattr(self, attr) for attr in type(self)._columns}
+
+    @classmethod
+    def from_dict(
+        cls, data: dict[str, Any] | list[dict[str, Any]]
+    ) -> Model | list[Model]:
+        """Create and save instance(s) from dict data.
+
+        Accepts a single dict or a list of dicts. Each record is applied
+        with :meth:`set` and then :meth:`save`. A list is saved inside a
+        single :meth:`Database.transaction`.
+
+        Args:
+            data: One attribute dict, or a list of them.
+
+        Returns:
+            The saved instance for a single dict, or a list of saved
+            instances for a list of dicts.
+        """
+        if isinstance(data, dict):
+            return cls().set(data).save()
+
+        with cls._db.transaction():
+            return [cls().set(record).save() for record in data]
+
+    @classmethod
+    def select(
+        cls,
+        order_by: list[str] | None = None,
+        filter: Callable[[Model], bool] | None = None,
+    ) -> list[Model]:
+        """Return all rows as model instances, optionally ordered and filtered.
+
+        Fetches every row (``SELECT *``), then applies ``filter`` in Python
+        if provided. There is no SQL ``WHERE`` DSL in v1.
+
+        Args:
+            order_by: Optional attribute names for SQL ``ORDER BY``.
+                Prefix with ``-`` for descending, ``+`` or no prefix for
+                ascending (for example ``["-last_login", "name"]``).
+            filter: Optional ``model -> bool`` predicate applied after
+                rows are hydrated.
+
+        Returns:
+            Matching model instances (possibly empty).
+
+        Raises:
+            ModelError: If an ``order_by`` entry names an unknown attribute.
+        """
+        cls._check_schema()
+        table = _quote_ident(cls.table_name)
+        stmt = f"SELECT * FROM {table}"
+        stmt += cls._order_by_sql(order_by)
+
+        models: list[Model] = []
+        for row in cls._db.execute(stmt):
+            model = cls().set_from_row(row)
+            if filter is not None and not filter(model):
+                continue
+            models.append(model)
+        return models
+
+    @classmethod
+    def _order_by_sql(cls, order_by: list[str] | None) -> str:
+        """Build an ``ORDER BY`` clause from attribute-name directives."""
+        if not order_by:
+            return ""
+
+        parts: list[str] = []
+        for item in order_by:
+            if item.startswith("-"):
+                attr = item[1:]
+                direction = "DESC"
+            elif item.startswith("+"):
+                attr = item[1:]
+                direction = "ASC"
+            else:
+                attr = item
+                direction = "ASC"
+
+            if attr not in cls._columns:
+                raise ModelError(
+                    f"Unknown attribute {attr!r} in order_by for {cls.__name__}"
+                )
+            sql_name = _quote_ident(cls._column_names[attr])
+            parts.append(f"{sql_name} {direction}")
+
+        return " ORDER BY " + ", ".join(parts)
