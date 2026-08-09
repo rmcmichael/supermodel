@@ -14,7 +14,7 @@ class Database:
 
     Call ``Database()`` anywhere to get the shared instance. Configure
     ``path`` before the first connection is opened. Default path is
-    ``":memory:"``.
+    ``None``; connecting before ``path`` is set raises ``RuntimeError``.
 
     Models register themselves via :meth:`register_model`. Schema checks
     run when the connection is first opened (for all registered models)
@@ -52,18 +52,19 @@ class Database:
             return
 
         self._initialized = True
-        self._path: str = ":memory:"
+        self._path: str | None = None
         self._connection: Connection | None = None
         self._last_cursor: Cursor | None = None
         self._models: list[type] = []
         self._in_transaction: bool = False
 
     @property
-    def path(self) -> str:
+    def path(self) -> str | None:
         """Filesystem path or SQLite URI for the database file.
 
-        Defaults to ``":memory:"``. Cannot be changed while a connection
-        is open; call :meth:`close` first.
+        Defaults to ``None``. Must be set before a connection is opened.
+        Cannot be changed while a connection is open; call :meth:`close`
+        first. Use ``":memory:"`` for an in-memory database.
 
         Raises:
             RuntimeError: If set while a connection is open.
@@ -71,12 +72,11 @@ class Database:
         return self._path
 
     @path.setter
-    def path(self, path: str) -> None:
+    def path(self, path: str | None) -> None:
         # Callers must close() before changing path while a connection is open.
         if self._connection is not None:
             raise RuntimeError("Cannot change path while connected; call close() first")
         self._path = path
-
     def register_model(self, model_cls: type) -> None:
         """Register a model class for schema ensure.
 
@@ -108,7 +108,12 @@ class Database:
         """Open the SQLite connection for ``path`` if needed, then return it.
 
         On first open, ensures schema for all registered models.
+
+        Raises:
+            RuntimeError: If ``path`` has not been set.
         """
+        if self._path is None:
+            raise RuntimeError("Database.path must be set before connecting")
         if self._connection is None:
             self._connection = sqlite3.connect(self._path)
             self._connection.row_factory = Row
@@ -134,12 +139,12 @@ class Database:
         """Reset the singleton to defaults.
 
         Closes any open connection, clears the model registry, and sets
-        ``path`` back to ``":memory:"``. Useful in tests and for
+        ``path`` back to ``None``. Useful in tests and for
         reconfiguration.
         """
         self.close()
         self._models.clear()
-        self._path = ":memory:"
+        self._path = None
 
     @contextmanager
     def transaction(self) -> Iterator["Database"]:

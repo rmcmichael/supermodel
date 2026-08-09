@@ -5,6 +5,7 @@ Easy Python class-oriented, model-first access to SQLite
 ## Database
 
 - TODO: Support synchronizing multiple copies of a database through an intermediary web service (not designed yet)
+- `Database.path` defaults to `None`; callers must set it before the first connection. Connecting with `path is None` raises `RuntimeError`. Use `":memory:"` when an in-memory database is desired
 - Outside an explicit transaction, `execute()` commits after each statement (same granular-commit behavior as today)
 - Provide a transaction context manager on the Database singleton, for example:
 

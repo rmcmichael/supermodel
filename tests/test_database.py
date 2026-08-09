@@ -38,10 +38,30 @@ def test_database_is_singleton(db):
     assert db is Database()
 
 
+def test_database_path_defaults_to_none(db):
+    db.reset()
+    assert db.path is None
+
+
 def test_database_path_property(db):
     assert db.path == ":memory:"
     db.path = "test.db"
     assert db.path == "test.db"
+
+
+def test_connect_without_path_raises(db):
+    db.reset()
+    assert db.path is None
+
+    with pytest.raises(RuntimeError, match="Database.path must be set before connecting"):
+        db._ensure_connection()
+
+    with pytest.raises(RuntimeError, match="Database.path must be set before connecting"):
+        db.execute("SELECT 1")
+
+    with pytest.raises(RuntimeError, match="Database.path must be set before connecting"):
+        with db.transaction():
+            pass
 
 
 def test_database_reset(db, tmp_path, fake_model):
@@ -52,10 +72,12 @@ def test_database_reset(db, tmp_path, fake_model):
     db.reset()
 
     assert db is Database()
-    assert db.path == ":memory:"
+    assert db.path is None
     assert db._connection is None
     assert db.lastrowid is None
     assert db._models == []
+
+    db.path = ":memory:"
     assert not db.table_exists("items")
 
 
@@ -243,8 +265,14 @@ def test_model_subclass_registers_with_database(db):
 
 
 def test_model_registers_before_path_is_set(db, tmp_path):
+    db.reset()
+    assert db.path is None
+
     class Widget(Model):
         pass
+
+    assert Widget in db._models
+    assert Widget._is_schema_checked is False
 
     db.path = str(tmp_path / "app.db")
     db._ensure_connection()

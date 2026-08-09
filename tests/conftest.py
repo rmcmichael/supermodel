@@ -7,5 +7,6 @@ from supermodel import Database
 def db():
     database = Database()
     database.reset()
+    database.path = ":memory:"
     yield database
     database.reset()
