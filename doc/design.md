@@ -1,13 +1,22 @@
-# SuperModel Design Notes
+# SuperModel Design
 
-Easy Python class-oriented, model-first access to SQLite
+Easy Python class-oriented, model-first access to SQLite.
+
+Models define the schema. Annotated class attributes become table columns. Persistence uses a fluent instance API (`User().set({...}).save()`). The library targets Python 3.13+ (for `uuid.uuid7`).
+
+## Goals
+
+- Model-first: schema comes from typed model classes
+- Simple: plain Python classes, fluent chaining, return values over callbacks
+- Synchronizable (future): support syncing multiple database copies through an intermediary web service (not designed yet)
 
 ## Database
 
-- TODO: Support synchronizing multiple copies of a database through an intermediary web service (not designed yet)
-- `Database.path` defaults to `None`; callers must set it before the first connection. Connecting with `path is None` raises `RuntimeError`. Use `":memory:"` when an in-memory database is desired
-- Outside an explicit transaction, `execute()` commits after each statement (same granular-commit behavior as today)
-- Provide a transaction context manager on the Database singleton, for example:
+`Database` is a process-wide singleton. Call `Database()` anywhere to get the shared instance.
+
+- `Database.path` defaults to `None`; callers must set it before the first connection. Connecting with `path is None` raises `RuntimeError`. Use `":memory:"` for an in-memory database
+- Outside an explicit transaction, `execute()` commits after each statement
+- Provide a transaction context manager:
 
 ```python
 with Database().transaction():
@@ -15,78 +24,77 @@ with Database().transaction():
     item.set({...}).save()
 ```
 
-- While inside `transaction()`, statements participate in one transaction: commit on clean exit, roll back if the block exits with an exception
-- Nested `transaction()` blocks are not required for v1; document that callers should not nest them
-- Needed for multi-row operations such as `from_dict` lists and future sync work; implement with the rest of the design changes
+- Inside `transaction()`, statements participate in one transaction: commit on clean exit, roll back if the block exits with an exception
+- Nested `transaction()` blocks are not supported in v1; callers must not nest them
+- Needed for multi-row operations such as `from_dict` lists and future sync work
+- Not thread-safe in v1 (single-thread use). A future design may move connection work onto a dedicated thread with a query queue
 
 ## Model
 
-### Differences in approach from the original implementation
+### Identity
 
-- IDs are now UUIDv7
-  - Previously, models were identified by an auto-incrementing database column
-  - Now, models are identified by a string populated by a UUIDv7 value
-  - On initialization, id is `None` (stored privately as `_id`)
-  - id is exposed as a read-only property (getter, no setter); callers cannot assign it
-  - `save()` follows the original pattern: if `id is None`, insert; otherwise update
-  - On first insert, the library generates a UUIDv7, assigns `_id`, and includes `ID` in the `INSERT`
-  - When hydrating from the database (`get` / `set_from_row` / `select`), the library sets `_id` from the row
-  - The primary key for the model's backing table will be a TEXT column named `ID`
-  - Requires Python 3.13+ for `uuid.uuid7`
+- Models are identified by a string primary key populated with a UUIDv7
+- On initialization, `id` is `None` (stored privately as `_id`)
+- `id` is a read-only property (getter only); callers cannot assign it
+- `save()`: if `id is None`, insert; otherwise update
+- On first insert, the library generates a UUIDv7, assigns `_id`, and includes `ID` in the `INSERT`
+- When hydrating from the database (`get` / `set_from_row` / `select`), the library sets `_id` from the row
+- The primary key for the model's backing table is a TEXT column named `ID`
 
-- Type Inference
-  - Previously, the type of the table column was determined by the value that an attribute was initialized with.
-  - Now the type of the table column will be determined by the type hint associated with the class attribute
-  - Example: `name: str = ""` will result in a TEXT column in the backing table
+### Schema from Annotations
 
-- Null Columns
-  - Previously, null columns were not allowed. Every column had to be populated with a value
-  - This was largely because type inference required an initial column value
-  - Now, if the type hint for an attribute allows `None` (for example `str | None`), the column in the backing table is allowed to contain a null
-  - Example: `name: str | None = None` will create a TEXT column that allows nulls
-  - Use `X | None` for nullable attributes in all cases (not `Optional[X]` or other spellings)
+- Column types are determined by the type hint on each class attribute (for example `name: str = ""` → TEXT)
+- Only annotated model fields are persisted; `_id` is handled separately from `_columns`
+- If the type hint allows `None` (for example `str | None`), the column may be null
+- Use `X | None` for nullable attributes (not `Optional[X]` or other spellings)
+- Example: `name: str | None = None` creates a TEXT column that allows nulls
 
-- Schema Updates
-  - Previously, the calling application had to call the `check_schema()` method for every model
-  - Now, `Model.__init_subclass__` registers each model with the Database singleton
-  - `_check_schema()` is private and idempotent
-  - `_check_schema()` runs when a model is registered if a connection is already open, and for all registered models when the connection is first opened (so importing models before `Database.path` is set still works)
-  - If the table does not exist, create it in one `CREATE TABLE` with the `ID` primary key and all known model columns
-  - If the table exists, add any missing columns with `ALTER TABLE ... ADD COLUMN` (additive only)
-  - Schema evolution non-goals: no column type changes, renames, or drops
-  - `on_table_created()` runs only when the table was newly created; subclasses may override it for seed data or similar setup
+### Schema Lifecycle
 
-- Table and Column Names
-  - By default, table names will be derived from the model class name as all-caps snake case
-  - By default, column names will be derived from the attribute name as all-caps snake case
-  - The user can specify the table name with the `table_name` property (getter and setter)
-  - The user can override a column name with `column_name(attribute_name, column_name)`
+- `Model.__init_subclass__` registers each model with the Database singleton
+- `_check_schema()` is private and idempotent
+- `_check_schema()` runs when a model is registered if a connection is already open, and for all registered models when the connection is first opened (so importing models before `Database.path` is set still works)
+- If the table does not exist, create it in one `CREATE TABLE` with the `ID` primary key and all known model columns
+- If the table exists, add any missing columns with `ALTER TABLE ... ADD COLUMN` (additive only)
+- Schema evolution non-goals: no column type changes, renames, or drops
+- `on_table_created()` runs only when the table was newly created; subclasses may override it for seed data or similar setup
+
+### Table and Column Names
+
+- By default, table names are derived from the model class name as all-caps snake case
+- By default, column names are derived from the attribute name as all-caps snake case
+- Override the table name with the `table_name` property (getter and setter)
+- Override a column name with `column_name(attribute_name, column_name)`
 
 ### Public Model API
 
-- Prefer a conversational / fluent style: mutating instance methods return `self` so callers can chain (for example `User().set({...}).save()`)
-- No `success=` callbacks on Model or Database methods. Rely on return values and chaining; callbacks can be added later if needed
-- Library-raised errors use `ModelError` (renamed from the original `ModelException`)
-- `save()` — if `id is None`, insert (assign UUIDv7); otherwise update. Returns `self`
-- `get(id)` — classmethod; loads the row for `id` into a new instance and returns it. Raises `ModelError` if the id does not exist
-- The original `getone()` is not carried forward
-- `remove()` — deletes the row for this instance when `id` is not `None`. Returns `self`
-- `select(order_by=None, filter=None)` — classmethod; returns a list of model instances
-  - `order_by`: optional list of attribute names for SQL `ORDER BY`. Prefix with `-` for descending and `+` (or no prefix) for ascending (same idea as the original library)
-  - `filter`: optional callable `model -> bool` applied in Python after rows are fetched. Rename of the original `where` parameter so it is not confused with SQL `WHERE`
-  - Filtering is post-fetch (`SELECT *`, then keep matching instances). No SQL `WHERE` DSL in v1
-  - The original in-library `groupby` post-processing is not carried forward; callers can group results themselves
-  - Example: `User.select(order_by=["-last_login", "name"], filter=lambda u: u.active)`
-- `count` — class-level property; number of rows in the model's table (for example `User.count`)
-- `set(values)` — populate attributes from a `dict`; returns `self`
-  - Values are expected as real Python types matching the attribute annotations
-  - No free-form string parsing (for example no `dateparser`); callers convert strings before `set`
-- `to_dict()` — return a `dict` of model attributes with Python values (including `date` / `time` / `datetime` / `bool`). Replaces the original `dict` property and `json_values`; no separate JSON export helper (callers may use `json.dumps` themselves if needed)
-- `from_dict(data)` — classmethod; replaces the original `load()`
-  - Accepts a single `dict` or a list of `dict`s
-  - For each record: create an instance, `set(...)`, `save()`
-  - A single `dict` returns that saved instance; a list returns a list of saved instances
-  - No `json_file` parameter; callers that have JSON should `json.load` / `json.loads` themselves and pass the resulting dict(s)
+Prefer a conversational / fluent style: mutating instance methods return `self` so callers can chain (for example `User().set({...}).save()`).
+
+Library-raised errors use `ModelError`. No `success=` callbacks on Model or Database methods; rely on return values and chaining.
+
+| API | Behavior |
+| --- | --- |
+| `save()` | If `id is None`, insert (assign UUIDv7); otherwise update. Returns `self` |
+| `get(id)` | Classmethod; loads the row for `id` into a new instance. Raises `ModelError` if missing |
+| `remove()` | Deletes the row for this instance when `id` is not `None`. Returns `self` |
+| `select(order_by=None, filter=None)` | Classmethod; returns a list of model instances |
+| `count` | Class-level property; row count for the model's table (for example `User.count`) |
+| `set(values)` | Populate attributes from a `dict`; returns `self` |
+| `to_dict()` | Return a `dict` of model attributes with Python values |
+| `from_dict(data)` | Classmethod; create and save from a `dict` or list of `dict`s |
+
+**`select` details**
+
+- `order_by`: optional list of attribute names for SQL `ORDER BY`. Prefix with `-` for descending and `+` (or no prefix) for ascending
+- `filter`: optional callable `model -> bool` applied in Python after rows are fetched
+- Filtering is post-fetch (`SELECT *`, then keep matching instances). No SQL `WHERE` DSL in v1
+- Example: `User.select(order_by=["-last_login", "name"], filter=lambda u: u.active)`
+
+**`set` / `to_dict` / `from_dict` details**
+
+- `set` expects real Python types matching the attribute annotations; callers convert strings before `set`
+- `to_dict` returns Python values (including `date` / `time` / `datetime` / `bool`). No separate JSON export helper; callers may use `json.dumps` if needed
+- `from_dict` accepts a single `dict` or a list of `dict`s. For each record: create an instance, `set(...)`, `save()`. A single `dict` returns that saved instance; a list returns a list of saved instances (list saves run inside one `Database.transaction()`). Callers that have JSON should `json.load` / `json.loads` themselves and pass the resulting dict(s)
 
 ### Model Attribute to Table Column Mapping
 
@@ -109,42 +117,57 @@ with Database().transaction():
 
 ### Defaults
 
-- The Column DDL scheme above is unchanged: required types use `NOT NULL DEFAULT <type sentinel>`; optional types use `DEFAULT NULL`
+- Required types use `NOT NULL DEFAULT <type sentinel>`; optional types use `DEFAULT NULL`
 - SQL `DEFAULT` values exist mainly so `ALTER TABLE ... ADD COLUMN` can succeed on a non-empty table (SQLite requires a default when adding a `NOT NULL` column). For existing rows, the new column is filled with that SQL default
 - Application code should rely on Python attribute defaults from the model class (for example `name: str = ""`, `active: bool = False`), not on the SQL sentinels
 - Type-level SQL sentinels such as `0`, `""`, `"0001-01-01"`, and `"00:00:00.000000"` must not be treated as meaningful application values
 - Per-field Python defaults are not mirrored into the SQL `DEFAULT` clause; constructors and instance initialization populate attribute values before insert
 
-### Implementation Notes on Types
+### Column Strategies
 
-- Every model has a private `_columns` map that will contain one item per persisted user attribute
-- Only annotated model fields are included; `_id` is handled separately from `_columns`
-- The key will be the attribute name
-- Each item will be an instance of a subclass of Column by type
-- The Column subclasses are IntColumn, FloatColumn, DateColumn, TimeColumn, DateTimeColumn, BoolColumn, and TextColumn
-- Model will delegate the DDL and value translation activities into those classes
+- Every model has a private `_columns` map with one entry per persisted user attribute
+- The key is the attribute name; each value is a subclass of `Column` by type
+- Column subclasses: `IntColumn`, `FloatColumn`, `DateColumn`, `TimeColumn`, `DateTimeColumn`, `BoolColumn`, `TextColumn`
+- Model delegates DDL and value translation to those classes
 - After a table is newly created, call `on_table_created()` on a fresh instance of the model class
 
 ### Date, Time, and DateTime Storage
 
-- **Breaking change** from the original library: stored TEXT formats are not wire-compatible with old databases
-  - Original `datetime`: `YYYY-MM-DD HH:MM:SS.ffffff` (naive, space separator)
-  - Original `time`: `HH:MM:SS` (no microseconds)
-  - Original `date`: `YYYY-MM-DD` (unchanged)
-- Canonical TEXT formats for the new library (same strings used for DDL defaults and codecs):
-  - `datetime.date`: `YYYY-MM-DD`
-  - `datetime.time`: `HH:MM:SS.ffffff` (microseconds included; naive, no timezone)
-  - `datetime.datetime`: `YYYY-MM-DDTHH:MM:SS.ffffff±HH:MM` (ISO-8601 with offset; timezone-aware)
+Canonical TEXT formats (same strings used for DDL defaults and codecs):
+
+- `datetime.date`: `YYYY-MM-DD`
+- `datetime.time`: `HH:MM:SS.ffffff` (microseconds included; naive, no timezone)
+- `datetime.datetime`: `YYYY-MM-DDTHH:MM:SS.ffffff±HH:MM` (ISO-8601 with offset; timezone-aware)
+
+Rules:
+
 - `time` attributes are always naive (no timezone)
 - `datetime` attributes are always timezone-aware
 - If a naive `datetime` is assigned, coerce it to UTC (treat the naive value as UTC and attach `timezone.utc`). Do not raise; keep the API simple
 
-## Implementation Plan
+## Package Exports
 
-Implement against this design in steps. **Each step includes unit tests for that slice** (not deferred to the end).
+Public API from the `supermodel` package: `Database`, `Model`, `ModelError`, and `__version__`.
 
-1. **Database** — DONE: model registry hooks, `transaction()`, schema ensure on first connection / late registration; unit tests for registry, transactions, and schema timing
-2. **Column types** — DONE: DDL fragments and to/from SQL codecs; unit tests for each column type’s DDL and value conversion
-3. **Model core** — DONE: annotations → `_columns`, `__init_subclass__`, identity, `save` / `get` / `remove`; unit tests for persistence and identity rules
-4. **Query and helpers** — DONE: `select`, `count`, `set`, `to_dict`, `from_dict`; unit tests for query/helper behavior
-5. **Package exports** — DONE: expose the public API from the package (`Database`, `Model`, `ModelError`, etc.) and add any remaining integration-style tests across slices
+## Out of Scope (v1)
+
+- Nested transactions
+- SQL `WHERE` DSL (use post-fetch `filter` instead)
+- Schema renames, type changes, or drops
+- Thread-safe Database access
+- Multi-copy sync over a web service (noted as future work; not designed)
+
+## Implemented
+
+The following design elements are implemented in `src/supermodel` with unit and integration tests under `tests/`:
+
+- **Database** — singleton, path gating, model registry, `transaction()`, schema ensure on first connection / late registration
+- **Column types** — DDL fragments and to/from SQL codecs for int, float, bool, str, date, time, datetime (nullable and required)
+- **Model core** — annotations → `_columns`, `__init_subclass__`, UUIDv7 identity, `save` / `get` / `remove`, table/column naming, additive schema, `on_table_created`
+- **Query and helpers** — `select`, `count`, `set`, `to_dict`, `from_dict` (including transactional list import)
+- **Package exports** — `Database`, `Model`, `ModelError`, `__version__` from `supermodel`
+
+Not yet implemented (design only):
+
+- Synchronizing multiple database copies through an intermediary web service
+- Dedicated Database worker thread / query queue
