@@ -27,3 +27,10 @@ loaded = User.get(user.id)
 ```
 
 See [doc/design.md](doc/design.md) for the full design.
+
+## Examples
+
+A minimal Textual contacts app lives in [`examples/contacts.py`](examples/contacts.py)::
+
+    pip install -e ".[examples]"
+    python examples/contacts.py
