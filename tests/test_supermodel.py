@@ -39,7 +39,7 @@ def test_public_symbols_match_submodules():
     assert ModelError is ModelErrorFromModule
 
 
-def test_integration_fluent_persist_query_and_transaction(db):
+def test_integration_fluent_persist_and_query(db):
     class User(Model):
         name: str = ""
         active: bool = False
@@ -51,33 +51,32 @@ def test_integration_fluent_persist_query_and_transaction(db):
         available: datetime = datetime(1, 1, 1, tzinfo=timezone.utc)
         note: str | None = None
 
-    with db.transaction():
-        alice = User().set(
-            {"name": "Alice", "active": True, "joined": date(2024, 1, 2)}
-        ).save()
-        bob = User().set(
-            {"name": "Bob", "active": False, "joined": date(2024, 2, 3)}
-        ).save()
-        Item().set(
-            {
-                "title": "widget",
-                "price": 1.5,
-                "available": datetime(
-                    2024, 3, 15, 14, 30, 5, 123456, tzinfo=timezone.utc
-                ),
-                "note": None,
-            }
-        ).save()
-        Item().set(
-            {
-                "title": "gadget",
-                "price": 2.25,
-                "available": datetime(
-                    2024, 4, 1, 9, 0, 0, tzinfo=timezone.utc
-                ),
-                "note": "spare",
-            }
-        ).save()
+    alice = User().set(
+        {"name": "Alice", "active": True, "joined": date(2024, 1, 2)}
+    ).save()
+    bob = User().set(
+        {"name": "Bob", "active": False, "joined": date(2024, 2, 3)}
+    ).save()
+    Item().set(
+        {
+            "title": "widget",
+            "price": 1.5,
+            "available": datetime(
+                2024, 3, 15, 14, 30, 5, 123456, tzinfo=timezone.utc
+            ),
+            "note": None,
+        }
+    ).save()
+    Item().set(
+        {
+            "title": "gadget",
+            "price": 2.25,
+            "available": datetime(
+                2024, 4, 1, 9, 0, 0, tzinfo=timezone.utc
+            ),
+            "note": "spare",
+        }
+    ).save()
 
     assert User.count == 2
     assert Item.count == 2
@@ -106,29 +105,6 @@ def test_integration_fluent_persist_query_and_transaction(db):
     assert User.count == 1
     with pytest.raises(ModelError, match="does not exist"):
         User.get(bob.id)
-
-
-def test_integration_transaction_rollback_across_models(db):
-    class Account(Model):
-        label: str = ""
-        balance: int = 0
-
-    class Ledger(Model):
-        memo: str = ""
-
-    Account().set({"label": "cash", "balance": 100}).save()
-    Ledger().set({"memo": "seed"}).save()
-
-    with pytest.raises(RuntimeError, match="boom"):
-        with db.transaction():
-            Account().set({"label": "vault", "balance": 50}).save()
-            Ledger().set({"memo": "pending"}).save()
-            raise RuntimeError("boom")
-
-    assert Account.count == 1
-    assert Ledger.count == 1
-    assert Account.select()[0].label == "cash"
-    assert Ledger.select()[0].memo == "seed"
 
 
 def test_integration_schema_and_on_table_created_via_public_api(db, tmp_path):

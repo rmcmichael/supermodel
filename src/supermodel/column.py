@@ -119,6 +119,10 @@ class TextColumn(Column):
         return value
 
 
+class FKColumn(TextColumn):
+    """TEXT column storing a related model's primary key id string."""
+
+
 class DateColumn(Column):
     sql_type = "TEXT"
     default_sql = '"0001-01-01"'

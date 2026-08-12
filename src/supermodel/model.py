@@ -9,6 +9,7 @@ import uuid
 from datetime import date
 from datetime import datetime
 from datetime import time
+from datetime import timezone
 from collections.abc import Callable
 
 from typing import Any
@@ -22,6 +23,7 @@ from .column import BoolColumn
 from .column import Column
 from .column import DateColumn
 from .column import DateTimeColumn
+from .column import FKColumn
 from .column import FloatColumn
 from .column import IntColumn
 from .column import TextColumn
@@ -78,17 +80,102 @@ def _unwrap_optional(annotation: Any) -> tuple[Any, bool]:
     return annotation, False
 
 
+def _is_model_type(annotation: Any) -> bool:
+    return (
+        isinstance(annotation, type)
+        and issubclass(annotation, Model)
+        and annotation is not Model
+    )
+
+
 def _column_for_annotation(annotation: Any) -> Column:
-    """Build a Column strategy from a field annotation."""
+    """Build a Column strategy from a scalar field annotation."""
     inner, nullable = _unwrap_optional(annotation)
     column_cls = _COLUMN_TYPES.get(inner)
     if column_cls is None:
         raise ModelError(
             f"Unsupported model field type: {annotation!r}. "
             "Use int, float, bool, str, date, time, datetime, "
-            "or those types with | None."
+            "a Model subclass (FK), list[Model] (virtual reverse), "
+            "or those scalar types with | None."
         )
     return column_cls(nullable=nullable)
+
+
+class _FKDescriptor:
+    """Lazy foreign-key attribute: stores parent id, resolves parent on access."""
+
+    def __init__(self, name: str, parent_cls: type[Model]) -> None:
+        self.name = name
+        self.parent_cls = parent_cls
+        self._obj_attr = f"_{name}_obj"
+
+    def __set_name__(self, owner: type[Model], name: str) -> None:
+        self.name = name
+        self._obj_attr = f"_{name}_obj"
+
+    def __get__(self, obj: Model | None, owner: type[Model] | None = None) -> Any:
+        if obj is None:
+            return self
+        if hasattr(obj, self._obj_attr):
+            return getattr(obj, self._obj_attr)
+        fk_id = obj._fk_ids.get(self.name)
+        if fk_id is None:
+            raise AttributeError(
+                f"{type(obj).__name__}.{self.name} has not been set"
+            )
+        parent = self.parent_cls.get(fk_id)
+        setattr(obj, self._obj_attr, parent)
+        return parent
+
+    def __set__(self, obj: Model, value: Any) -> None:
+        if value is None:
+            raise ModelError(
+                f"{type(obj).__name__}.{self.name} requires a "
+                f"{self.parent_cls.__name__} instance (got None)"
+            )
+        if not isinstance(value, self.parent_cls):
+            raise ModelError(
+                f"{type(obj).__name__}.{self.name} requires a "
+                f"{self.parent_cls.__name__} instance "
+                f"(got {type(value).__name__})"
+            )
+        setattr(obj, self._obj_attr, value)
+        obj._fk_ids[self.name] = value.id
+
+
+class _CollectionDescriptor:
+    """Virtual one-to-many reverse relation: lazy list of child instances."""
+
+    def __init__(
+        self, name: str, child_cls: type[Model], fk_attr: str
+    ) -> None:
+        self.name = name
+        self.child_cls = child_cls
+        self.fk_attr = fk_attr
+        self._cache_attr = f"_{name}_list"
+
+    def __set_name__(self, owner: type[Model], name: str) -> None:
+        self.name = name
+        self._cache_attr = f"_{name}_list"
+
+    def __get__(self, obj: Model | None, owner: type[Model] | None = None) -> Any:
+        if obj is None:
+            return self
+        if hasattr(obj, self._cache_attr):
+            return getattr(obj, self._cache_attr)
+        if obj.id is None:
+            result: list[Model] = []
+        else:
+            result = self.child_cls._select_by_fk(self.fk_attr, obj.id)
+        setattr(obj, self._cache_attr, result)
+        return result
+
+    def __set__(self, obj: Model, value: Any) -> None:
+        raise ModelError(
+            f"{type(obj).__name__}.{self.name} is a virtual collection; "
+            "assign the child foreign key and save the child instead"
+        )
 
 
 class _CountDescriptor:
@@ -114,16 +201,24 @@ class Model:
     Unsupported field types and a reserved ``id`` annotation raise
     :class:`ModelError` when the subclass is defined.
 
+    Model-typed attributes are foreign keys (required; no ``| None`` in v1).
+    ``list[ChildModel]`` attributes are virtual reverse relations (no column).
+
     Identity uses a read-only ``id`` property backed by private ``_id``.
     ``save()`` inserts (assigning a UUIDv7) when ``id is None``, otherwise
-    updates. ``get`` / ``remove`` load and delete by that id. Query helpers
-    include ``select``, ``count``, ``set``, ``to_dict``, and ``from_dict``.
+    updates. ``get`` / ``remove`` load and delete by that id (``remove``
+    cascades to children that reference this row). Query helpers include
+    ``select``, ``count``, ``set``, ``to_dict``, and ``from_dict``.
     """
 
     _is_schema_checked: bool = False
     _db: Database = Database()
     _columns: ClassVar[dict[str, Column]]
     _column_names: ClassVar[dict[str, str]]
+    _fk_attrs: ClassVar[dict[str, type[Model]]]
+    _collection_attrs: ClassVar[dict[str, tuple[type[Model], str]]]
+    _pending_annotations: ClassVar[dict[str, Any]]
+    _relations_resolved: ClassVar[bool]
     table_name: ClassVar[str]
     count = _CountDescriptor()
 
@@ -131,36 +226,181 @@ class Model:
         super().__init_subclass__(**kwargs)
         # Each concrete subclass gets its own flag; do not share the base value.
         cls._is_schema_checked = False
-        cls._columns = cls._build_columns()
-        cls._column_names = {attr: _to_upper_snake(attr) for attr in cls._columns}
+        cls._relations_resolved = False
+        cls._fk_attrs = {}
+        cls._collection_attrs = {}
+        cls._pending_annotations = {}
+        cls._columns = {}
+        cls._column_names = {}
         cls.table_name = _to_upper_snake(cls.__name__)
+        cls._ingest_annotations()
         Database().register_model(cls)
 
     @classmethod
-    def _build_columns(cls) -> dict[str, Column]:
-        """Map persisted attribute names to Column strategies from annotations.
+    def _ingest_annotations(cls) -> None:
+        """Classify annotations into columns, FKs, collections, or deferred."""
+        raw: dict[str, Any] = {}
+        for base in reversed(cls.__mro__):
+            if base is Model or base is object:
+                continue
+            for name, annotation in getattr(base, "__annotations__", {}).items():
+                if name.startswith("_"):
+                    continue
+                raw[name] = annotation
 
-        Skips names starting with ``_`` and ``ClassVar`` annotations. Raises
-        :class:`ModelError` if a field is named ``id`` (reserved) or if an
-        annotation cannot be mapped to a supported column type.
-        """
-        columns: dict[str, Column] = {}
-        # Includes inherited annotations; subclass overrides win.
-        for name, annotation in get_type_hints(cls).items():
-            if name.startswith("_"):
+        if "id" in raw:
+            raise ModelError(
+                "Cannot declare a persisted field named 'id'; "
+                "it is reserved for the read-only identity property"
+            )
+
+        hints = cls._safe_type_hints()
+        for name, annotation in raw.items():
+            resolved = hints.get(name, annotation)
+            if get_origin(resolved) is ClassVar:
                 continue
-            if name == "id":
+            cls._classify_field(name, resolved)
+
+        cls._column_names = {
+            attr: _to_upper_snake(attr) for attr in cls._columns
+        }
+
+    @classmethod
+    def _safe_type_hints(cls) -> dict[str, Any]:
+        try:
+            return get_type_hints(cls)
+        except Exception:
+            pass
+        module = __import__(cls.__module__, fromlist=["*"])
+        globalns = dict(vars(module))
+        # Ensure Model module names are visible when resolving base ClassVars.
+        import supermodel.model as model_module
+
+        globalns.update(vars(model_module))
+        localns = {m.__name__: m for m in Database()._models}
+        localns[cls.__name__] = cls
+        try:
+            return get_type_hints(cls, globalns=globalns, localns=localns)
+        except Exception:
+            return {}
+
+    @classmethod
+    def _classify_field(cls, name: str, annotation: Any) -> None:
+        if get_origin(annotation) is ClassVar:
+            return
+        if isinstance(annotation, str):
+            cls._pending_annotations[name] = annotation
+            return
+
+        inner, nullable = _unwrap_optional(annotation)
+        origin = get_origin(inner)
+
+        if origin is list:
+            args = get_args(inner)
+            if len(args) != 1:
                 raise ModelError(
-                    "Cannot declare a persisted field named 'id'; "
-                    "it is reserved for the read-only identity property"
+                    f"Unsupported model field type: {annotation!r}. "
+                    "Use list[SomeModel] for virtual reverse relations."
                 )
-            if get_origin(annotation) is ClassVar:
+            child = args[0]
+            if isinstance(child, str) or not isinstance(child, type):
+                cls._pending_annotations[name] = annotation
+                return
+            if not _is_model_type(child):
+                raise ModelError(
+                    f"Unsupported model field type: {annotation!r}. "
+                    "list[...] reverse relations require a Model subclass."
+                )
+            if nullable:
+                raise ModelError(
+                    f"{cls.__name__}.{name}: virtual collections cannot be optional"
+                )
+            cls._collection_attrs[name] = (child, "")
+            setattr(cls, name, _CollectionDescriptor(name, child, ""))
+            return
+
+        if isinstance(inner, str) or not isinstance(inner, type):
+            cls._pending_annotations[name] = annotation
+            return
+
+        if _is_model_type(inner):
+            if nullable:
+                raise ModelError(
+                    f"{cls.__name__}.{name}: optional foreign keys "
+                    f"(Model | None) are not supported yet; use {inner.__name__}"
+                )
+            cls._fk_attrs[name] = inner
+            cls._columns[name] = FKColumn(nullable=False)
+            setattr(cls, name, _FKDescriptor(name, inner))
+            return
+
+        cls._columns[name] = _column_for_annotation(annotation)
+
+    @classmethod
+    def _resolve_relations(cls) -> None:
+        """Resolve deferred annotations and wire collection → FK links."""
+        if cls._pending_annotations:
+            hints = cls._safe_type_hints()
+            resolved_names = []
+            for name, raw in list(cls._pending_annotations.items()):
+                annotation = hints.get(name)
+                if annotation is None or isinstance(annotation, str):
+                    continue
+                # Temporarily remove so classify does not re-pend the same key blindly.
+                resolved_names.append(name)
+                cls._pending_annotations.pop(name, None)
+                cls._classify_field(name, annotation)
+                if name in cls._pending_annotations:
+                    # Still unresolved (nested forward ref).
+                    continue
+            cls._column_names = {
+                attr: _to_upper_snake(attr) for attr in cls._columns
+            }
+
+        # Link virtual collections to the child's FK attribute.
+        for coll_name, (child_cls, _fk) in list(cls._collection_attrs.items()):
+            if not _is_model_type(child_cls):
                 continue
-            columns[name] = _column_for_annotation(annotation)
-        return columns
+            # Ensure child has resolved its FKs first.
+            if getattr(child_cls, "_pending_annotations", None):
+                child_cls._resolve_relations()
+            fk_matches = [
+                attr
+                for attr, parent in child_cls._fk_attrs.items()
+                if parent is cls
+            ]
+            if len(fk_matches) == 0:
+                if cls._pending_annotations or child_cls._pending_annotations:
+                    continue
+                raise ModelError(
+                    f"{cls.__name__}.{coll_name}: no foreign key on "
+                    f"{child_cls.__name__} pointing at {cls.__name__}"
+                )
+            if len(fk_matches) > 1:
+                raise ModelError(
+                    f"{cls.__name__}.{coll_name}: multiple foreign keys on "
+                    f"{child_cls.__name__} point at {cls.__name__}; "
+                    "ambiguous reverse relation"
+                )
+            fk_attr = fk_matches[0]
+            cls._collection_attrs[coll_name] = (child_cls, fk_attr)
+            setattr(cls, coll_name, _CollectionDescriptor(coll_name, child_cls, fk_attr))
+
+        if not cls._pending_annotations:
+            cls._relations_resolved = True
+
+    @classmethod
+    def _ensure_relations_resolved(cls) -> None:
+        Database()._resolve_all_relations()
+        if cls._pending_annotations:
+            raise ModelError(
+                f"{cls.__name__} has unresolved relation annotations: "
+                f"{sorted(cls._pending_annotations)}"
+            )
 
     def __init__(self, **kwargs: Any) -> None:
         self._id: str | None = None
+        self._fk_ids: dict[str, str | None] = {}
 
     @property
     def id(self) -> str | None:
@@ -194,6 +434,7 @@ class Model:
         missing columns with ``ALTER TABLE`` (additive only). Calls
         :meth:`on_table_created` on a fresh instance when the table is new.
         """
+        cls._ensure_relations_resolved()
         if cls._is_schema_checked:
             return
         cls._is_schema_checked = True
@@ -239,17 +480,43 @@ class Model:
         """Insert a new row or update an existing one.
 
         If ``id is None``, generates a UUIDv7, inserts, and sets ``_id``.
-        Otherwise updates the row for the current ``id``.
+        Otherwise updates the row for the current ``id``. Required foreign
+        keys must reference a parent that already has an ``id``.
+
+        Does not cascade: only this instance is written. Related parents
+        and children are not saved.
 
         Returns:
             ``self`` for fluent chaining.
         """
         type(self)._check_schema()
+        self._validate_foreign_keys()
         if self._id is None:
             self._insert_row()
         else:
             self._update_row()
+        self._db.cache_put(self)
         return self
+
+    def _validate_foreign_keys(self) -> None:
+        for attr in type(self)._fk_attrs:
+            parent_id = self._fk_sql_id(attr)
+            if parent_id is None:
+                obj = getattr(self, f"_{attr}_obj", None)
+                if obj is None and attr not in self._fk_ids:
+                    raise ModelError(
+                        f"{type(self).__name__}.{attr} must be set before save()"
+                    )
+                raise ModelError(
+                    f"{type(self).__name__}.{attr} parent must be saved "
+                    f"(parent id is None) before save()"
+                )
+
+    def _fk_sql_id(self, attr: str) -> str | None:
+        obj = getattr(self, f"_{attr}_obj", None)
+        if obj is not None:
+            return obj.id
+        return self._fk_ids.get(attr)
 
     def _insert_row(self) -> None:
         self._id = str(uuid.uuid7())
@@ -262,7 +529,11 @@ class Model:
             f"({', '.join(sql_names)}) "
             f"VALUES ({', '.join(placeholders)})"
         )
-        self._db.execute(stmt, self._sql_params())
+        try:
+            self._db.execute(stmt, self._sql_params())
+        except Exception:
+            self._id = None
+            raise
 
     def _update_row(self) -> None:
         attrs = list(self._columns)
@@ -277,48 +548,116 @@ class Model:
         """Bind parameters for insert/update (attribute names as keys)."""
         params: dict[str, Any] = {"id": self._id}
         for attr, column in self._columns.items():
-            params[attr] = column.to_sql(getattr(self, attr))
+            if attr in type(self)._fk_attrs:
+                fk_id = self._fk_sql_id(attr)
+                params[attr] = column.to_sql(fk_id)
+            else:
+                value = getattr(self, attr)
+                # Keep in-memory datetime values timezone-aware after coerce.
+                if isinstance(value, datetime) and value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
+                    setattr(self, attr, value)
+                params[attr] = column.to_sql(value)
         return params
 
     @classmethod
     def get(cls, id: str) -> Model:
         """Load the row for ``id`` into a new instance.
 
+        Returns a cached instance when the identity map already holds
+        this ``(class, id)``.
+
         Args:
             id: Primary key value to load.
 
         Returns:
-            A new model instance hydrated from the row.
+            A model instance hydrated from the row (or the cached one).
 
         Raises:
             ModelError: If no row exists for ``id``.
         """
         cls._check_schema()
+        cached = cls._db.cache_get(cls, id)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+
         table = _quote_ident(cls.table_name)
         stmt = f'SELECT * FROM {table} WHERE "ID" = ?'
         row = cls._db.execute(stmt, (id,)).fetchone()
         if row is None:
             raise ModelError(f"Id {id} does not exist in Model {cls.table_name}")
-        return cls().set_from_row(row)
+        instance = cls().set_from_row(row)
+        cls._db.cache_put(instance)
+        return instance
 
     def remove(self) -> Model:
         """Delete this instance's row when ``id`` is not ``None``.
+
+        Cascades: removes child rows whose foreign keys point at this
+        instance (recursively), then deletes this row and evicts it from
+        the identity cache. Each statement commits independently.
 
         Returns:
             ``self`` for fluent chaining.
         """
         type(self)._check_schema()
-        if self._id is not None:
-            table = _quote_ident(self.table_name)
-            stmt = f'DELETE FROM {table} WHERE "ID" = ?'
-            self._db.execute(stmt, (self._id,))
+        if self._id is None:
+            return self
+        self._cascade_remove_children(seen=set())
+        table = _quote_ident(type(self).table_name)
+        stmt = f'DELETE FROM {table} WHERE "ID" = ?'
+        self._db.execute(stmt, (self._id,))
+        self._db.cache_evict(type(self), self._id)
         return self
+
+    def _cascade_remove_children(self, seen: set[tuple[type, str]]) -> None:
+        key = (type(self), self._id)  # type: ignore[arg-type]
+        if key in seen:
+            raise ModelError(
+                f"Relationship cycle detected while removing {type(self).__name__} "
+                f"id={self._id}"
+            )
+        seen.add(key)
+
+        parent_cls = type(self)
+        for model_cls in list(self._db._models):
+            fk_attrs = getattr(model_cls, "_fk_attrs", {})
+            for fk_attr, fk_parent in fk_attrs.items():
+                if fk_parent is not parent_cls:
+                    continue
+                for child in model_cls._select_by_fk(fk_attr, self._id):  # type: ignore[arg-type]
+                    child._cascade_remove_children(seen)
+                    child_table = _quote_ident(model_cls.table_name)
+                    stmt = f'DELETE FROM {child_table} WHERE "ID" = ?'
+                    self._db.execute(stmt, (child.id,))
+                    if child.id is not None:
+                        self._db.cache_evict(model_cls, child.id)
+
+    @classmethod
+    def _select_by_fk(cls, fk_attr: str, parent_id: str) -> list[Model]:
+        """Load rows whose foreign-key column equals ``parent_id``."""
+        cls._check_schema()
+        table = _quote_ident(cls.table_name)
+        sql_name = _quote_ident(cls._column_names[fk_attr])
+        stmt = f"SELECT * FROM {table} WHERE {sql_name} = ?"
+        models: list[Model] = []
+        for row in cls._db.execute(stmt, (parent_id,)):
+            row_id = row["ID"]
+            cached = cls._db.cache_get(cls, row_id)
+            if cached is not None:
+                models.append(cached)  # type: ignore[arg-type]
+                continue
+            model = cls().set_from_row(row)
+            cls._db.cache_put(model)
+            models.append(model)
+        return models
 
     def set_from_row(self, row: Any) -> Model:
         """Hydrate this instance from a SQLite row mapping.
 
         Sets ``_id`` from the ``ID`` column and each annotated attribute
-        via the corresponding Column codec.
+        via the corresponding Column codec. Foreign keys store the parent
+        id for lazy resolution.
 
         Args:
             row: A ``sqlite3.Row`` (or mapping) with SQL column names.
@@ -329,14 +668,22 @@ class Model:
         self._id = row["ID"]
         for attr, column in type(self)._columns.items():
             sql_name = type(self)._column_names[attr]
-            setattr(self, attr, column.from_sql(row[sql_name]))
+            value = column.from_sql(row[sql_name])
+            if attr in type(self)._fk_attrs:
+                self._fk_ids[attr] = value
+                obj_attr = f"_{attr}_obj"
+                if hasattr(self, obj_attr):
+                    delattr(self, obj_attr)
+            else:
+                setattr(self, attr, value)
         return self
 
     def set(self, values: dict[str, Any]) -> Model:
         """Populate persisted attributes from a dict of Python values.
 
-        Only keys that match annotated model fields are applied. Values
-        must already be the correct Python types (no string parsing).
+        Only keys that match annotated model fields are applied. Scalar
+        values must already be the correct Python types. Foreign keys
+        accept a parent id ``str`` or a parent model instance.
 
         Args:
             values: Attribute name → value mapping.
@@ -345,18 +692,42 @@ class Model:
             ``self`` for fluent chaining.
         """
         for attr in type(self)._columns:
-            if attr in values:
-                setattr(self, attr, values[attr])
+            if attr not in values:
+                continue
+            value = values[attr]
+            if attr in type(self)._fk_attrs:
+                parent_cls = type(self)._fk_attrs[attr]
+                if isinstance(value, parent_cls):
+                    setattr(self, attr, value)
+                elif isinstance(value, str):
+                    self._fk_ids[attr] = value
+                    obj_attr = f"_{attr}_obj"
+                    if hasattr(self, obj_attr):
+                        delattr(self, obj_attr)
+                else:
+                    raise ModelError(
+                        f"{type(self).__name__}.{attr} expects "
+                        f"{parent_cls.__name__} or id str, got {type(value).__name__}"
+                    )
+            else:
+                setattr(self, attr, value)
         return self
 
     def to_dict(self) -> dict[str, Any]:
         """Return persisted attributes as a dict of Python values.
 
-        Includes annotated model fields only (not ``id``). Values are
-        native Python types (``date``, ``time``, ``datetime``, ``bool``,
-        etc.), not SQL encodings.
+        Includes annotated model fields only (not ``id``). Foreign keys
+        are exported as parent id strings. Virtual collections are omitted.
+        Values are native Python types (``date``, ``time``, ``datetime``,
+        ``bool``, etc.), not SQL encodings.
         """
-        return {attr: getattr(self, attr) for attr in type(self)._columns}
+        result: dict[str, Any] = {}
+        for attr in type(self)._columns:
+            if attr in type(self)._fk_attrs:
+                result[attr] = self._fk_sql_id(attr)
+            else:
+                result[attr] = getattr(self, attr)
+        return result
 
     @classmethod
     def from_dict(
@@ -365,8 +736,9 @@ class Model:
         """Create and save instance(s) from dict data.
 
         Accepts a single dict or a list of dicts. Each record is applied
-        with :meth:`set` and then :meth:`save`. A list is saved inside a
-        single :meth:`Database.transaction`.
+        with :meth:`set` and then :meth:`save`. List items are saved
+        sequentially (each ``save`` commits independently); a failure
+        mid-list can leave earlier rows persisted.
 
         Args:
             data: One attribute dict, or a list of them.
@@ -378,8 +750,7 @@ class Model:
         if isinstance(data, dict):
             return cls().set(data).save()
 
-        with cls._db.transaction():
-            return [cls().set(record).save() for record in data]
+        return [cls().set(record).save() for record in data]
 
     @classmethod
     def select(
@@ -390,7 +761,8 @@ class Model:
         """Return all rows as model instances, optionally ordered and filtered.
 
         Fetches every row (``SELECT *``), then applies ``filter`` in Python
-        if provided. There is no SQL ``WHERE`` DSL in v1.
+        if provided. There is no SQL ``WHERE`` DSL in v1. Rows already in
+        the identity cache are returned as-is (in-memory attributes win).
 
         Args:
             order_by: Optional attribute names for SQL ``ORDER BY``.
@@ -412,7 +784,13 @@ class Model:
 
         models: list[Model] = []
         for row in cls._db.execute(stmt):
-            model = cls().set_from_row(row)
+            row_id = row["ID"]
+            cached = cls._db.cache_get(cls, row_id)
+            if cached is not None:
+                model = cached  # type: ignore[assignment]
+            else:
+                model = cls().set_from_row(row)
+                cls._db.cache_put(model)
             if filter is not None and not filter(model):
                 continue
             models.append(model)

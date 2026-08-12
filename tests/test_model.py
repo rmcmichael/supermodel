@@ -163,7 +163,7 @@ def test_save_update_and_get_round_trip(db):
     assert thing.id == original_id
 
     loaded = Thing.get(original_id)
-    assert loaded is not thing
+    assert loaded is thing
     assert loaded.id == original_id
     assert loaded.label == "after"
     assert loaded.active is False
@@ -405,7 +405,7 @@ def test_from_dict_list_saves_all_and_returns_list(db):
     assert Thing.count == 2
 
 
-def test_from_dict_list_uses_transaction(db):
+def test_from_dict_list_partial_commit_on_failure(db):
     class Thing(Model):
         label: str = ""
 
@@ -424,7 +424,8 @@ def test_from_dict_list_uses_transaction(db):
     finally:
         Thing.set = original_set  # type: ignore[method-assign]
 
-    assert Thing.count == 0
+    assert Thing.count == 1
+    assert Thing.select()[0].label == "a"
 
 
 def test_count_property(db):

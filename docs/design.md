@@ -15,19 +15,18 @@ Models define the schema. Annotated class attributes become table columns. Persi
 `Database` is a process-wide singleton. Call `Database()` anywhere to get the shared instance.
 
 - `Database.path` defaults to `None`; callers must set it before the first connection. Connecting with `path is None` raises `RuntimeError`. Use `":memory:"` for an in-memory database
-- Outside an explicit transaction, `execute()` commits after each statement
-- Provide a transaction context manager:
-
-```python
-with Database().transaction():
-    user.set({...}).save()
-    item.set({...}).save()
-```
-
-- Inside `transaction()`, statements participate in one transaction: commit on clean exit, roll back if the block exits with an exception
-- Nested `transaction()` blocks are not supported in v1; callers must not nest them
-- Needed for multi-row operations such as `from_dict` lists and future sync work
+- `execute()` commits after each successful statement. There is no multi-statement transaction API
+- Multi-row helpers (`from_dict` lists, cascade `remove`) commit each statement independently; a failure mid-sequence can leave a partial result
 - Not thread-safe in v1 (single-thread use). A future design may move connection work onto a dedicated thread with a query queue
+
+### Identity cache
+
+- `Database` owns a process-wide `WeakValueDictionary` keyed by `(model_class, id)`
+- `get`, `select`, lazy foreign keys, and lazy collections return the cached instance when present
+- After a successful insert, the instance is registered; `remove` (and cascade) evicts eagerly
+- When the last strong reference to an instance is gone, GC drops it and the weak cache entry disappears
+- Shared mutation is intentional: two `get`s of the same id return the same object
+- If `select` finds a cached id, it returns that instance without overwriting in-memory attributes
 
 ## Model
 
@@ -37,7 +36,7 @@ with Database().transaction():
 - On initialization, `id` is `None` (stored privately as `_id`)
 - `id` is a read-only property (getter only); callers cannot assign it
 - `save()`: if `id is None`, insert; otherwise update
-- On first insert, the library generates a UUIDv7, assigns `_id`, and includes `ID` in the `INSERT`
+- On first insert, the library generates a UUIDv7, assigns `_id`, and includes `ID` in the `INSERT`. If the insert fails, `_id` is cleared
 - When hydrating from the database (`get` / `set_from_row` / `select`), the library sets `_id` from the row
 - The primary key for the model's backing table is a TEXT column named `ID`
 
@@ -51,6 +50,38 @@ with Database().transaction():
 - Example: `name: str | None = None` creates a TEXT column that allows nulls
 - An annotated field whose type is not one of the supported mappings (see [Model Attribute to Table Column Mapping](#model-attribute-to-table-column-mapping)) raises `ModelError` when the model class is defined, not later at save time
 - Declaring a persisted field named `id` also raises `ModelError` (reserved for the read-only identity property)
+
+### Relationships (one-to-many)
+
+```python
+from __future__ import annotations
+
+class Log(Model):
+    title: str = ""
+    qsos: list[QSO]  # virtual reverse relation (no column)
+
+class QSO(Model):
+    comment: str = ""
+    log: Log  # required FK column storing Log.id
+```
+
+- Child FK: annotate with the parent model type (required; no `| None` in v1). No default is required on the class attribute. Maps to a TEXT NOT NULL column storing the parent `id`
+- Parent collection: annotate with `list[ChildModel]`. Virtual — no column. Lazy-loads children whose FK points at this parent
+- Forward references (parent declared above child) need postponed annotations (`from __future__ import annotations`) or equivalent
+- Writes go through the child: `qso.log = log; qso.save()`
+- `save()` persists **only this instance** (no cascade to parent or children). It raises `ModelError` if a required FK is unset, or if the parent has `id is None`
+- FK attribute access is lazy: hydrate stores the parent id; first access resolves via `Parent.get` (identity cache)
+- Virtual collections are read-only for persistence; assigning to them raises `ModelError`. Mutate by setting the child FK and saving
+- `to_dict` / `set` / `from_dict`: FK fields use parent id strings; virtual collections are omitted
+- If a parent declares `list[Child]` and the child has more than one FK to that parent type, registration raises `ModelError` (ambiguous reverse)
+
+### Cascade remove
+
+- Unlike `save()`, `remove()` **does** cascade
+- `remove()` deletes children that reference this instance via FK (discovered from registered models), recursively, then deletes this row
+- Descendants are removed before ancestors; each delete commits independently
+- Relationship cycles raise `ModelError`
+- If `id is None`, `remove()` is a no-op
 
 ### Schema Lifecycle
 
@@ -77,13 +108,13 @@ Library-raised errors use `ModelError`. No `success=` callbacks on Model or Data
 
 | API | Behavior |
 | --- | --- |
-| `save()` | If `id is None`, insert (assign UUIDv7); otherwise update. Returns `self` |
-| `get(id)` | Classmethod; loads the row for `id` into a new instance. Raises `ModelError` if missing |
-| `remove()` | Deletes the row for this instance when `id` is not `None`. Returns `self` |
-| `select(order_by=None, filter=None)` | Classmethod; returns a list of model instances |
+| `save()` | If `id is None`, insert (assign UUIDv7); otherwise update. Validates required FKs. Does **not** cascade to related models. Returns `self` |
+| `get(id)` | Classmethod; returns the identity-cached instance or loads from the row. Raises `ModelError` if missing |
+| `remove()` | Cascade-deletes children, then this row when `id` is not `None`. Returns `self` |
+| `select(order_by=None, filter=None)` | Classmethod; returns a list of model instances (identity cache aware) |
 | `count` | Class-level property; row count for the model's table (for example `User.count`) |
-| `set(values)` | Populate attributes from a `dict`; returns `self` |
-| `to_dict()` | Return a `dict` of model attributes with Python values |
+| `set(values)` | Populate attributes from a `dict`; FK values may be parent id `str` or parent instance; returns `self` |
+| `to_dict()` | Return a `dict` of model attributes with Python values (FKs as id strings) |
 | `from_dict(data)` | Classmethod; create and save from a `dict` or list of `dict`s |
 
 **`select` details**
@@ -95,9 +126,9 @@ Library-raised errors use `ModelError`. No `success=` callbacks on Model or Data
 
 **`set` / `to_dict` / `from_dict` details**
 
-- `set` expects real Python types matching the attribute annotations; callers convert strings before `set`
-- `to_dict` returns Python values (including `date` / `time` / `datetime` / `bool`). No separate JSON export helper; callers may use `json.dumps` if needed
-- `from_dict` accepts a single `dict` or a list of `dict`s. For each record: create an instance, `set(...)`, `save()`. A single `dict` returns that saved instance; a list returns a list of saved instances (list saves run inside one `Database.transaction()`). Callers that have JSON should `json.load` / `json.loads` themselves and pass the resulting dict(s)
+- `set` expects real Python types matching the attribute annotations; callers convert strings before `set`. FK fields also accept a parent id string
+- `to_dict` returns Python values (including `date` / `time` / `datetime` / `bool`). FK fields are parent id strings. Virtual collections are omitted. No separate JSON export helper; callers may use `json.dumps` if needed
+- `from_dict` accepts a single `dict` or a list of `dict`s. For each record: create an instance, `set(...)`, `save()`. A single `dict` returns that saved instance; a list returns a list of saved instances (each `save` commits independently). Callers that have JSON should `json.load` / `json.loads` themselves and pass the resulting dict(s)
 
 ### Model Attribute to Table Column Mapping
 
@@ -117,6 +148,8 @@ Library-raised errors use `ModelError`. No `success=` callbacks on Model or Data
 | bool \| None                | INTEGER DEFAULT NULL                                     |
 | str                         | TEXT NOT NULL DEFAULT ""                                 |
 | str \| None                 | TEXT DEFAULT NULL                                        |
+| Model subclass (FK)         | TEXT NOT NULL DEFAULT "" (stores related `id`)           |
+| list[Model]                 | (no column — virtual reverse relation)                   |
 
 ### Defaults
 
@@ -125,12 +158,13 @@ Library-raised errors use `ModelError`. No `success=` callbacks on Model or Data
 - Application code should rely on Python attribute defaults from the model class (for example `name: str = ""`, `active: bool = False`), not on the SQL sentinels
 - Type-level SQL sentinels such as `0`, `""`, `"0001-01-01"`, and `"00:00:00.000000"` must not be treated as meaningful application values
 - Per-field Python defaults are not mirrored into the SQL `DEFAULT` clause; constructors and instance initialization populate attribute values before insert
+- Required FK attributes need no class default; enforce at `save()` time
 
 ### Column Strategies
 
-- Every model has a private `_columns` map with one entry per persisted user attribute
+- Every model has a private `_columns` map with one entry per persisted user attribute (including FK fields)
 - The key is the attribute name; each value is a subclass of `Column` by type
-- Column subclasses: `IntColumn`, `FloatColumn`, `DateColumn`, `TimeColumn`, `DateTimeColumn`, `BoolColumn`, `TextColumn`
+- Column subclasses: `IntColumn`, `FloatColumn`, `DateColumn`, `TimeColumn`, `DateTimeColumn`, `BoolColumn`, `TextColumn`, `FKColumn`
 - Model delegates DDL and value translation to those classes
 - After a table is newly created, call `on_table_created()` on a fresh instance of the model class
 
@@ -154,7 +188,8 @@ Public API from the `supermodel` package: `Database`, `Model`, `ModelError`, and
 
 ## Out of Scope (v1)
 
-- Nested transactions
+- Multi-statement transactions / transaction context manager
+- Optional foreign keys (`Model | None`)
 - SQL `WHERE` DSL (use post-fetch `filter` instead)
 - Schema renames, type changes, or drops
 - Thread-safe Database access
@@ -164,13 +199,15 @@ Public API from the `supermodel` package: `Database`, `Model`, `ModelError`, and
 
 The following design elements are implemented in `src/supermodel` with unit and integration tests under `tests/`:
 
-- **Database** — singleton, path gating, model registry, `transaction()`, schema ensure on first connection / late registration
-- **Column types** — DDL fragments and to/from SQL codecs for int, float, bool, str, date, time, datetime (nullable and required)
+- **Database** — singleton, path gating, model registry, per-statement commit, weak identity cache, schema ensure on first connection / late registration
+- **Column types** — DDL fragments and to/from SQL codecs for int, float, bool, str, date, time, datetime, and FK (nullable and required where applicable)
 - **Model core** — annotations → `_columns`, `__init_subclass__`, UUIDv7 identity, `save` / `get` / `remove`, table/column naming, additive schema, `on_table_created`
-- **Query and helpers** — `select`, `count`, `set`, `to_dict`, `from_dict` (including transactional list import)
+- **Relationships** — required FK attributes, virtual `list[Child]` reverse relations, lazy load, cascade `remove`
+- **Query and helpers** — `select`, `count`, `set`, `to_dict`, `from_dict` (list import commits per row)
 - **Package exports** — `Database`, `Model`, `ModelError`, `__version__` from `supermodel`
 
 Not yet implemented (design only):
 
 - Synchronizing multiple database copies through an intermediary web service
 - Dedicated Database worker thread / query queue
+- Optional foreign keys (`Model | None`)

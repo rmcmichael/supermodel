@@ -1,10 +1,10 @@
 import re
 import sqlite3
-from contextlib import contextmanager
 from sqlite3 import Connection
 from sqlite3 import Cursor
 from sqlite3 import Row
-from typing import Iterator
+from weakref import WeakValueDictionary
+
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -21,8 +21,12 @@ class Database:
     and immediately when a model registers while a connection is already
     open.
 
-    Outside an explicit :meth:`transaction`, :meth:`execute` commits after
-    each statement. Nested ``transaction()`` blocks are not supported.
+    :meth:`execute` commits after each successful statement. There is no
+    multi-statement transaction API.
+
+    Maintains a :class:`~weakref.WeakValueDictionary` identity cache so
+    ``get`` / ``select`` / relation loading return the same instance for a
+    given model class and id while a strong reference remains.
 
     Not thread-safe: use from a single thread. A future design may move
     database work onto a dedicated thread with a query queue.
@@ -57,7 +61,7 @@ class Database:
         self._connection: Connection | None = None
         self._last_cursor: Cursor | None = None
         self._models: list[type] = []
-        self._in_transaction: bool = False
+        self._identity: WeakValueDictionary = WeakValueDictionary()
 
     @property
     def path(self) -> str | None:
@@ -78,25 +82,55 @@ class Database:
         if self._connection is not None:
             raise RuntimeError("Cannot change path while connected; call close() first")
         self._path = path
+
     def register_model(self, model_cls: type) -> None:
         """Register a model class for schema ensure.
 
         Idempotent for a given class. If a connection is already open,
         calls ``model_cls._check_schema()`` immediately. Otherwise the
-        schema is ensured when the connection is first opened.
+        schema is ensured when the connection is first opened. After
+        registration, attempts to resolve deferred relation annotations
+        across all registered models.
 
         Args:
             model_cls: Model subclass (or test double) exposing
                 ``_check_schema`` and ``_is_schema_checked``.
         """
-        if model_cls in self._models:
-            return
-        self._models.append(model_cls)
+        if model_cls not in self._models:
+            self._models.append(model_cls)
+        self._resolve_all_relations()
         if self._connection is not None:
             model_cls._check_schema()
 
+    def _resolve_all_relations(self) -> None:
+        """Resolve deferred FK / collection annotations on registered models."""
+        for model_cls in list(self._models):
+            resolve = getattr(model_cls, "_resolve_relations", None)
+            if resolve is not None:
+                resolve()
+
+    def cache_get(self, model_cls: type, id: str) -> object | None:
+        """Return the cached instance for ``(model_cls, id)``, if any."""
+        return self._identity.get((model_cls, id))
+
+    def cache_put(self, instance: object) -> None:
+        """Register ``instance`` in the identity cache when it has an id."""
+        instance_id = getattr(instance, "id", None)
+        if instance_id is None:
+            return
+        self._identity[(type(instance), instance_id)] = instance
+
+    def cache_evict(self, model_cls: type, id: str) -> None:
+        """Remove ``(model_cls, id)`` from the identity cache if present."""
+        self._identity.pop((model_cls, id), None)
+
+    def clear_identity_cache(self) -> None:
+        """Drop all identity-cache entries."""
+        self._identity = WeakValueDictionary()
+
     def _ensure_schemas(self) -> None:
         """Run ``_check_schema`` for every registered model."""
+        self._resolve_all_relations()
         for model_cls in self._models:
             model_cls._check_schema()
 
@@ -125,64 +159,34 @@ class Database:
         """Close the open connection, if any.
 
         Clears the last cursor used by :attr:`lastrowid` and
-        :attr:`rowcount`. Resets per-connection schema-checked flags on
-        registered models so the next open re-ensures schemas. Does not
-        change ``path`` or the model registry.
+        :attr:`rowcount`. Clears the identity cache and resets
+        per-connection schema-checked flags on registered models so the
+        next open re-ensures schemas. Does not change ``path`` or the
+        model registry.
         """
         if self._connection is not None:
             self._connection.close()
             self._connection = None
         self._last_cursor = None
-        self._in_transaction = False
+        self.clear_identity_cache()
         self._clear_schema_checked()
 
     def reset(self) -> None:
         """Reset the singleton to defaults.
 
-        Closes any open connection, clears the model registry, and sets
-        ``path`` back to ``None``. Useful in tests and for
+        Closes any open connection, clears the model registry and identity
+        cache, and sets ``path`` back to ``None``. Useful in tests and for
         reconfiguration.
         """
         self.close()
         self._models.clear()
         self._path = None
 
-    @contextmanager
-    def transaction(self) -> Iterator["Database"]:
-        """Run statements in a single transaction.
-
-        Commits on clean exit; rolls back if the block exits with an
-        exception. Nested ``transaction()`` blocks are not supported.
-
-        Yields:
-            The shared Database instance.
-
-        Raises:
-            RuntimeError: If called while already inside a transaction.
-        """
-        if self._in_transaction:
-            raise RuntimeError("Nested Database.transaction() is not supported")
-
-        connection = self._ensure_connection()
-        self._in_transaction = True
-        try:
-            connection.execute("BEGIN")
-            yield self
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            self._in_transaction = False
-
     def execute(self, sql: str, params: tuple | dict | None = None) -> Cursor:
-        """Execute SQL and return the cursor.
+        """Execute SQL, commit on success, and return the cursor.
 
-        Outside :meth:`transaction`, commits after every statement
-        (granular commits). Inside a transaction, does not commit; the
-        surrounding transaction commits or rolls back as a whole.
-        On ``sqlite3.Error`` outside a transaction, rolls back and
-        re-raises.
+        Commits after every successful statement. On ``sqlite3.Error``,
+        rolls back and re-raises.
 
         Args:
             sql: SQL statement to run.
@@ -198,13 +202,11 @@ class Database:
         connection = self._ensure_connection()
         try:
             result = connection.execute(sql, () if params is None else params)
-            if not self._in_transaction:
-                connection.commit()
+            connection.commit()
             self._last_cursor = result
             return result
         except sqlite3.Error:
-            if not self._in_transaction:
-                connection.rollback()
+            connection.rollback()
             raise
 
     @property

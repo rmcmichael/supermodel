@@ -59,10 +59,6 @@ def test_connect_without_path_raises(db):
     with pytest.raises(RuntimeError, match="Database.path must be set before connecting"):
         db.execute("SELECT 1")
 
-    with pytest.raises(RuntimeError, match="Database.path must be set before connecting"):
-        with db.transaction():
-            pass
-
 
 def test_database_reset(db, tmp_path, fake_model):
     db.path = str(tmp_path / "test.db")
@@ -290,30 +286,7 @@ def test_check_schema_is_idempotent(db):
     assert Widget._is_schema_checked is True
 
 
-def test_transaction_commits_on_success(db):
-    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
-
-    with db.transaction():
-        db.execute("INSERT INTO items (name) VALUES ('one')")
-        db.execute("INSERT INTO items (name) VALUES ('two')")
-
-    rows = db.execute("SELECT name FROM items ORDER BY id").fetchall()
-    assert [row["name"] for row in rows] == ["one", "two"]
-
-
-def test_transaction_rolls_back_on_error(db):
-    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
-
-    with pytest.raises(RuntimeError, match="boom"):
-        with db.transaction():
-            db.execute("INSERT INTO items (name) VALUES ('one')")
-            raise RuntimeError("boom")
-
-    rows = db.execute("SELECT name FROM items").fetchall()
-    assert rows == []
-
-
-def test_execute_outside_transaction_commits_immediately(db, tmp_path):
+def test_execute_commits_immediately(db, tmp_path):
     db.path = str(tmp_path / "commit.db")
     db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
     db.execute("INSERT INTO items (name) VALUES ('visible')")
@@ -324,31 +297,3 @@ def test_execute_outside_transaction_commits_immediately(db, tmp_path):
             "SELECT name FROM items WHERE name = 'visible'"
         ).fetchone()
         assert row["name"] == "visible"
-
-
-def test_execute_inside_transaction_defers_commit(db, tmp_path):
-    db.path = str(tmp_path / "defer.db")
-    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
-
-    with db.transaction():
-        db.execute("INSERT INTO items (name) VALUES ('pending')")
-        assert db._in_transaction is True
-        with sqlite3.connect(db.path, timeout=0.2) as other:
-            other.row_factory = Row
-            row = other.execute(
-                "SELECT name FROM items WHERE name = 'pending'"
-            ).fetchone()
-            assert row is None
-
-    assert db._in_transaction is False
-    row = db.execute(
-        "SELECT name FROM items WHERE name = 'pending'"
-    ).fetchone()
-    assert row["name"] == "pending"
-
-
-def test_nested_transaction_raises(db):
-    with db.transaction():
-        with pytest.raises(RuntimeError, match="Nested"):
-            with db.transaction():
-                pass
