@@ -1,0 +1,41 @@
+{
+    "python.testing.pytestArgs": [
+        "tests"
+    ],
+    "python.terminal.activateEnvironment": true,
+    "python.terminal.activateEnvInCurrentTerminal": true,
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true,
+    "workbench.activityBar.orientation": "vertical",
+    "editor.formatOnSave": true,
+    "[python]": {
+        "editor.defaultFormatter": "ms-python.black-formatter",
+        "editor.formatOnSave": true
+    },
+    "black-formatter.args": [
+        "--line-length",
+        "88"
+    ],
+    "python.venvPath": "venv",
+    "files.exclude": {
+        "**/__pycache__": true,
+        "**/*.py[cod]": true,
+        "**/*$py.class": true,
+        "**/.pytest_cache": true,
+        "**/.mypy_cache": true,
+        "**/.ruff_cache": true,
+        "**/.coverage": true,
+        "**/htmlcov": true,
+        "**/.tox": true,
+        "**/.nox": true,
+        "**/.hypothesis": true,
+        "**/.venv": true,
+        "**/venv": true,
+        "**/env": true,
+        "**/.env": true,
+        "**/dist": true,
+        "**/build": true,
+        "**/*.egg-info": true
+    },
+    "files.autoSave": "onWindowChange"
+}

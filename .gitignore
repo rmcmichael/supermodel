@@ -44,7 +44,6 @@ coverage.xml
 
 # Editors / OS
 .idea/
-.vscode/
 *.swp
 *.swo
 *~
