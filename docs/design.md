@@ -49,6 +49,8 @@ with Database().transaction():
 - If the type hint allows `None` (for example `str | None`), the column may be null
 - Use `X | None` for nullable attributes (not `Optional[X]` or other spellings)
 - Example: `name: str | None = None` creates a TEXT column that allows nulls
+- An annotated field whose type is not one of the supported mappings (see [Model Attribute to Table Column Mapping](#model-attribute-to-table-column-mapping)) raises `ModelError` when the model class is defined, not later at save time
+- Declaring a persisted field named `id` also raises `ModelError` (reserved for the read-only identity property)
 
 ### Schema Lifecycle
 

@@ -43,7 +43,12 @@ _COLUMN_TYPES: dict[type, type[Column]] = {
 
 
 class ModelError(Exception):
-    """Error raised by SuperModel for invalid model operations."""
+    """Error raised by SuperModel for invalid model operations.
+
+    Raised at class definition time for unsupported annotated field types or
+    a reserved ``id`` field, and at runtime for invalid operations such as
+    missing rows, unknown attributes, or bad identifiers.
+    """
 
     def __init__(self, message: str = "") -> None:
         super().__init__(message)
@@ -106,6 +111,8 @@ class Model:
     backing table on first connection (or immediately if already connected).
     Annotated fields whose names start with ``_`` are ignored for schema
     and persistence (use them for non-persistent instance state).
+    Unsupported field types and a reserved ``id`` annotation raise
+    :class:`ModelError` when the subclass is defined.
 
     Identity uses a read-only ``id`` property backed by private ``_id``.
     ``save()`` inserts (assigning a UUIDv7) when ``id is None``, otherwise
@@ -134,7 +141,8 @@ class Model:
         """Map persisted attribute names to Column strategies from annotations.
 
         Skips names starting with ``_`` and ``ClassVar`` annotations. Raises
-        :class:`ModelError` if a field is named ``id`` (reserved).
+        :class:`ModelError` if a field is named ``id`` (reserved) or if an
+        annotation cannot be mapped to a supported column type.
         """
         columns: dict[str, Column] = {}
         # Includes inherited annotations; subclass overrides win.
