@@ -50,6 +50,16 @@ def test_columns_built_from_annotations(db):
     assert Person._columns["nickname"].nullable is True
 
 
+def test_columns_skip_underscore_attributes(db):
+    class Person(Model):
+        name: str = ""
+        _scratch: str = ""
+
+    assert set(Person._columns) == {"name"}
+    assert "_scratch" not in Person._columns
+    assert "_scratch" not in Person._column_names
+
+
 def test_columns_include_inherited_annotations(db):
     class Animal(Model):
         name: str = ""

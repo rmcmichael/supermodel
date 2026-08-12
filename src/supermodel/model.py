@@ -5,10 +5,12 @@ from __future__ import annotations
 import re
 import types
 import uuid
+
 from datetime import date
 from datetime import datetime
 from datetime import time
 from collections.abc import Callable
+
 from typing import Any
 from typing import ClassVar
 from typing import Union
@@ -24,6 +26,7 @@ from .column import FloatColumn
 from .column import IntColumn
 from .column import TextColumn
 from .column import TimeColumn
+
 from .database import Database
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -101,6 +104,8 @@ class Model:
     Subclasses declare annotated fields; SuperModel builds a ``_columns``
     map, registers the class with :class:`Database`, and ensures the
     backing table on first connection (or immediately if already connected).
+    Annotated fields whose names start with ``_`` are ignored for schema
+    and persistence (use them for non-persistent instance state).
 
     Identity uses a read-only ``id`` property backed by private ``_id``.
     ``save()`` inserts (assigning a UUIDv7) when ``id is None``, otherwise
@@ -120,15 +125,17 @@ class Model:
         # Each concrete subclass gets its own flag; do not share the base value.
         cls._is_schema_checked = False
         cls._columns = cls._build_columns()
-        cls._column_names = {
-            attr: _to_upper_snake(attr) for attr in cls._columns
-        }
+        cls._column_names = {attr: _to_upper_snake(attr) for attr in cls._columns}
         cls.table_name = _to_upper_snake(cls.__name__)
         Database().register_model(cls)
 
     @classmethod
     def _build_columns(cls) -> dict[str, Column]:
-        """Map persisted attribute names to Column strategies from annotations."""
+        """Map persisted attribute names to Column strategies from annotations.
+
+        Skips names starting with ``_`` and ``ClassVar`` annotations. Raises
+        :class:`ModelError` if a field is named ``id`` (reserved).
+        """
         columns: dict[str, Column] = {}
         # Includes inherited annotations; subclass overrides win.
         for name, annotation in get_type_hints(cls).items():
@@ -165,9 +172,7 @@ class Model:
                 not a safe SQL identifier.
         """
         if attribute_name not in cls._columns:
-            raise ModelError(
-                f"Unknown attribute {attribute_name!r} on {cls.__name__}"
-            )
+            raise ModelError(f"Unknown attribute {attribute_name!r} on {cls.__name__}")
         if not _IDENTIFIER.match(column_name):
             raise ModelError(f"Invalid column name: {column_name!r}")
         cls._column_names[attribute_name] = column_name
@@ -241,9 +246,7 @@ class Model:
     def _insert_row(self) -> None:
         self._id = str(uuid.uuid7())
         attrs = list(self._columns)
-        sql_names = ['"ID"'] + [
-            _quote_ident(self._column_names[a]) for a in attrs
-        ]
+        sql_names = ['"ID"'] + [_quote_ident(self._column_names[a]) for a in attrs]
         placeholders = [":id"] + [f":{a}" for a in attrs]
         table = _quote_ident(self.table_name)
         stmt = (
@@ -287,9 +290,7 @@ class Model:
         stmt = f'SELECT * FROM {table} WHERE "ID" = ?'
         row = cls._db.execute(stmt, (id,)).fetchone()
         if row is None:
-            raise ModelError(
-                f"Id {id} does not exist in Model {cls.table_name}"
-            )
+            raise ModelError(f"Id {id} does not exist in Model {cls.table_name}")
         return cls().set_from_row(row)
 
     def remove(self) -> Model:
