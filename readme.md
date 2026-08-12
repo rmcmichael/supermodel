@@ -4,6 +4,16 @@ Simple, model-first SQLite for Python.
 
 SuperModel (`supermodel`) persists plain Python classes in SQLite. Models define the schema; annotated attributes become columns. Requires Python 3.13+.
 
+## Installation
+
+Not on PyPI yet. Install from GitHub:
+
+```bash
+pip install "git+https://github.com/rmcmichael/supermodel.git"
+```
+
+Pin a branch, tag, or commit with `@ref` (for example `@main`). For local development of this repo, use `pip install -e .`.
+
 ## Highlights
 
 - **Model-first** — declare typed fields on a `Model` subclass; the library creates and evolves tables (additive only)
