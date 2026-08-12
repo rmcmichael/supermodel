@@ -18,6 +18,9 @@ dist/
 .eggs/
 pip-wheel-metadata/
 
+# Sphinx
+docs/_build/
+
 # Test / coverage
 .pytest_cache/
 .coverage

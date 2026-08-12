@@ -27,7 +27,8 @@ class Database:
     Not thread-safe: use from a single thread. A future design may move
     database work onto a dedicated thread with a query queue.
 
-    Example:
+    Example::
+
         db = Database()
         db.path = "app.db"
         db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
@@ -35,7 +36,7 @@ class Database:
 
     TODO: Consider moving the connection to a dedicated thread with a query queue.
     TODO: Support synchronizing multiple copies of a database through an
-        intermediary web service (not designed yet).
+    intermediary web service (not designed yet).
     """
 
     _instance = None

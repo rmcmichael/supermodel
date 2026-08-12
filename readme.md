@@ -26,7 +26,16 @@ user = User().set({"name": "Ada", "active": True}).save()
 loaded = User.get(user.id)
 ```
 
-See [doc/design.md](doc/design.md) for the full design.
+See [docs/design.md](docs/design.md) for the full design.
+
+## Documentation
+
+Build HTML docs (Sphinx) from the repo root::
+
+    pip install -e ".[docs]"
+    sphinx-build -b html docs docs/_build/html
+
+Then open `docs/_build/html/index.html`.
 
 ## Examples
 
