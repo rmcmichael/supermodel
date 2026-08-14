@@ -19,7 +19,7 @@ Pin a branch, tag, or commit with `@ref` (for example `@main`). For local develo
 - **Model-first** — declare typed fields on a `Model` subclass; the library creates and evolves tables (additive only)
 - **Fluent API** — chain instance methods, for example `User().set({...}).save()`
 - **UUIDv7 identity** — read-only string `id`, assigned on first insert
-- **Type-hinted columns** — `str`, `int`, `float`, `bool`, `date`, `time`, `datetime`, and `X | None` for nullables; model types for foreign keys; `list[Model]` for virtual reverse relations
+- **Type-hinted columns** — `str`, `int`, `float`, `bool`, `date`, `time`, `datetime`, and `X | None` for nullables; model types for foreign keys (`Parent | None` for optional); `list[Model]` for virtual reverse relations
 - **Automatic schema** — models register on subclassing; tables are ensured when the database connects
 - **One-to-Many** - easy one-to-many relationships
 - **Identity cache** — one in-memory instance per `(model, id)` while referenced

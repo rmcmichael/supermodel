@@ -63,22 +63,23 @@ class Log(Model):
 class QSO(Model):
     comment: str = ""
     log: Log  # required FK column storing Log.id
+    # or: log: Log | None  # optional FK; NULL when unset
 ```
 
-- Child FK: annotate with the parent model type (required; no `| None` in v1). No default is required on the class attribute. Maps to a TEXT NOT NULL column storing the parent `id`
+- Child FK: annotate with the parent model type. Required (`Log`) maps to a TEXT NOT NULL column storing the parent `id`. Optional (`Log | None`) maps to TEXT DEFAULT NULL. No default is required on the class attribute
 - Parent collection: annotate with `list[ChildModel]`. Virtual — no column. Lazy-loads children whose FK points at this parent
 - Forward references (parent declared above child) need postponed annotations (`from __future__ import annotations`) or equivalent
 - Writes go through the child: `qso.log = log; qso.save()`
-- `save()` persists **only this instance** (no cascade to parent or children). It raises `ModelError` if a required FK is unset, or if the parent has `id is None`
-- FK attribute access is lazy: hydrate stores the parent id; first access resolves via `Parent.get` (identity cache)
-- Virtual collections are read-only for persistence; assigning to them raises `ModelError`. Mutate by setting the child FK and saving
-- `to_dict` / `set` / `from_dict`: FK fields use parent id strings; virtual collections are omitted
+- `save()` persists **only this instance** (no cascade to parent or children). It raises `ModelError` if a required FK is unset, or if an assigned parent has `id is None`. Optional FKs may be unset or `None` (stored as `NULL`)
+- FK attribute access is lazy: hydrate stores the parent id; first access resolves via `Parent.get` (identity cache). A null optional FK returns `None` without loading
+- Virtual collections are read-only for persistence; assigning to them raises `ModelError`. Mutate by setting the child FK and saving. Children with a `NULL` FK are omitted from the collection
+- `to_dict` / `set` / `from_dict`: FK fields use parent id strings (or `None` for optional FKs); virtual collections are omitted
 - If a parent declares `list[Child]` and the child has more than one FK to that parent type, registration raises `ModelError` (ambiguous reverse)
 
 ### Cascade remove
 
 - Unlike `save()`, `remove()` **does** cascade
-- `remove()` deletes children that reference this instance via FK (discovered from registered models), recursively, then deletes this row
+- `remove()` deletes children that reference this instance via FK (discovered from registered models), recursively, then deletes this row. Children whose FK is `NULL` are not dependents and are left in place
 - Descendants are removed before ancestors; each delete commits independently
 - Relationship cycles raise `ModelError`
 - If `id is None`, `remove()` is a no-op
@@ -108,13 +109,13 @@ Library-raised errors use `ModelError`. No `success=` callbacks on Model or Data
 
 | API | Behavior |
 | --- | --- |
-| `save()` | If `id is None`, insert (assign UUIDv7); otherwise update. Validates required FKs. Does **not** cascade to related models. Returns `self` |
+| `save()` | If `id is None`, insert (assign UUIDv7); otherwise update. Validates required FKs (optional FKs may be `NULL`). Does **not** cascade to related models. Returns `self` |
 | `get(id)` | Classmethod; returns the identity-cached instance or loads from the row. Raises `ModelError` if missing |
 | `remove()` | Cascade-deletes children, then this row when `id` is not `None`. Returns `self` |
 | `select(order_by=None, filter=None)` | Classmethod; returns a list of model instances (identity cache aware) |
 | `count` | Class-level property; row count for the model's table (for example `User.count`) |
-| `set(values)` | Populate attributes from a `dict`; FK values may be parent id `str` or parent instance; returns `self` |
-| `to_dict()` | Return a `dict` of model attributes with Python values (FKs as id strings) |
+| `set(values)` | Populate attributes from a `dict`; FK values may be parent id `str`, parent instance, or `None` if optional; returns `self` |
+| `to_dict()` | Return a `dict` of model attributes with Python values (FKs as id strings or `None`) |
 | `from_dict(data)` | Classmethod; create and save from a `dict` or list of `dict`s |
 
 **`select` details**
@@ -126,8 +127,8 @@ Library-raised errors use `ModelError`. No `success=` callbacks on Model or Data
 
 **`set` / `to_dict` / `from_dict` details**
 
-- `set` expects real Python types matching the attribute annotations; callers convert strings before `set`. FK fields also accept a parent id string
-- `to_dict` returns Python values (including `date` / `time` / `datetime` / `bool`). FK fields are parent id strings. Virtual collections are omitted. No separate JSON export helper; callers may use `json.dumps` if needed
+- `set` expects real Python types matching the attribute annotations; callers convert strings before `set`. FK fields also accept a parent id string, or `None` for optional FKs
+- `to_dict` returns Python values (including `date` / `time` / `datetime` / `bool`). FK fields are parent id strings, or `None` when the FK is unset or null. Virtual collections are omitted. No separate JSON export helper; callers may use `json.dumps` if needed
 - `from_dict` accepts a single `dict` or a list of `dict`s. For each record: create an instance, `set(...)`, `save()`. A single `dict` returns that saved instance; a list returns a list of saved instances (each `save` commits independently). Callers that have JSON should `json.load` / `json.loads` themselves and pass the resulting dict(s)
 
 ### Model Attribute to Table Column Mapping
@@ -149,6 +150,7 @@ Library-raised errors use `ModelError`. No `success=` callbacks on Model or Data
 | str                         | TEXT NOT NULL DEFAULT ""                                 |
 | str \| None                 | TEXT DEFAULT NULL                                        |
 | Model subclass (FK)         | TEXT NOT NULL DEFAULT "" (stores related `id`)           |
+| Model subclass \| None (FK) | TEXT DEFAULT NULL (stores related `id` or NULL)          |
 | list[Model]                 | (no column — virtual reverse relation)                   |
 
 ### Defaults
@@ -158,7 +160,7 @@ Library-raised errors use `ModelError`. No `success=` callbacks on Model or Data
 - Application code should rely on Python attribute defaults from the model class (for example `name: str = ""`, `active: bool = False`), not on the SQL sentinels
 - Type-level SQL sentinels such as `0`, `""`, `"0001-01-01"`, and `"00:00:00.000000"` must not be treated as meaningful application values
 - Per-field Python defaults are not mirrored into the SQL `DEFAULT` clause; constructors and instance initialization populate attribute values before insert
-- Required FK attributes need no class default; enforce at `save()` time
+- Required FK attributes need no class default; enforce at `save()` time. Optional FKs (`Parent | None`) persist `NULL` when unset
 
 ### Column Strategies
 
@@ -189,7 +191,6 @@ Public API from the `supermodel` package: `Database`, `Model`, `ModelError`, and
 ## Out of Scope (v1)
 
 - Multi-statement transactions / transaction context manager
-- Optional foreign keys (`Model | None`)
 - SQL `WHERE` DSL (use post-fetch `filter` instead)
 - Schema renames, type changes, or drops
 - Thread-safe Database access
@@ -202,7 +203,7 @@ The following design elements are implemented in `src/supermodel` with unit and 
 - **Database** — singleton, path gating, model registry, per-statement commit, weak identity cache, schema ensure on first connection / late registration
 - **Column types** — DDL fragments and to/from SQL codecs for int, float, bool, str, date, time, datetime, and FK (nullable and required where applicable)
 - **Model core** — annotations → `_columns`, `__init_subclass__`, UUIDv7 identity, `save` / `get` / `remove`, table/column naming, additive schema, `on_table_created`
-- **Relationships** — required FK attributes, virtual `list[Child]` reverse relations, lazy load, cascade `remove`
+- **Relationships** — required and optional (`Parent | None`) FK attributes, virtual `list[Child]` reverse relations, lazy load, cascade `remove`
 - **Query and helpers** — `select`, `count`, `set`, `to_dict`, `from_dict` (list import commits per row)
 - **Package exports** — `Database`, `Model`, `ModelError`, `__version__` from `supermodel`
 
@@ -210,4 +211,3 @@ Not yet implemented (design only):
 
 - Synchronizing multiple database copies through an intermediary web service
 - Dedicated Database worker thread / query queue
-- Optional foreign keys (`Model | None`)

@@ -6,6 +6,7 @@ import pytest
 
 from supermodel import Model
 from supermodel import ModelError
+from supermodel.column import FKColumn
 
 
 def test_fk_save_and_lazy_parent(db):
@@ -162,3 +163,118 @@ def test_from_dict_fk_as_id(db):
     qso = QSO.from_dict({"comment": "cq", "log": log.id})
     assert isinstance(qso, QSO)
     assert qso.log is log
+
+
+def test_optional_fk_annotation_is_nullable(db):
+    class Log(Model):
+        title: str = ""
+        qsos: list[QSO]
+
+    class QSO(Model):
+        comment: str = ""
+        log: Log | None
+
+    assert isinstance(QSO._columns["log"], FKColumn)
+    assert QSO._columns["log"].nullable is True
+    assert "DEFAULT NULL" in QSO._columns["log"].ddl
+
+
+def test_optional_fk_unset_saves_null(db):
+    class Log(Model):
+        title: str = ""
+        qsos: list[QSO]
+
+    class QSO(Model):
+        comment: str = ""
+        log: Log | None
+
+    qso = QSO()
+    qso.comment = "orphan"
+    qso.save()
+
+    assert qso.log is None
+    assert qso.to_dict() == {"comment": "orphan", "log": None}
+
+    loaded = QSO.get(qso.id)
+    assert loaded.log is None
+    row = db.execute("SELECT LOG FROM QSO WHERE ID = ?", (qso.id,)).fetchone()
+    assert row["LOG"] is None
+
+
+def test_optional_fk_explicit_none_round_trip(db):
+    class Log(Model):
+        title: str = ""
+        qsos: list[QSO]
+
+    class QSO(Model):
+        comment: str = ""
+        log: Log | None
+
+    log = Log().set({"title": "Test"}).save()
+    qso = QSO().set({"comment": "cq", "log": None}).save()
+    assert qso.log is None
+
+    qso.log = log
+    qso.save()
+    assert QSO.get(qso.id).log is log
+
+    qso.log = None
+    qso.save()
+    loaded = QSO.get(qso.id)
+    assert loaded.log is None
+    assert loaded.to_dict()["log"] is None
+
+
+def test_optional_fk_from_dict_none(db):
+    class Log(Model):
+        title: str = ""
+        qsos: list[QSO]
+
+    class QSO(Model):
+        comment: str = ""
+        log: Log | None
+
+    qso = QSO.from_dict({"comment": "cq", "log": None})
+    assert isinstance(qso, QSO)
+    assert qso.log is None
+
+
+def test_required_fk_rejects_none_on_assign_and_set(db):
+    class Log(Model):
+        title: str = ""
+        qsos: list[QSO]
+
+    class QSO(Model):
+        comment: str = ""
+        log: Log
+
+    qso = QSO()
+    with pytest.raises(ModelError, match="got None"):
+        qso.log = None
+    with pytest.raises(ModelError, match="got None"):
+        qso.set({"log": None})
+
+
+def test_optional_fk_null_excluded_from_collection_and_cascade(db):
+    class Log(Model):
+        title: str = ""
+        qsos: list[QSO]
+
+    class QSO(Model):
+        comment: str = ""
+        log: Log | None
+
+    log = Log().set({"title": "Test"}).save()
+    attached = QSO().set({"comment": "linked", "log": log}).save()
+    orphan = QSO().set({"comment": "orphan", "log": None}).save()
+
+    loaded = Log.get(log.id)
+    assert {q.comment for q in loaded.qsos} == {"linked"}
+
+    log.remove()
+    assert Log.count == 0
+    with pytest.raises(ModelError, match="does not exist"):
+        QSO.get(attached.id)
+    surviving = QSO.get(orphan.id)
+    assert surviving.comment == "orphan"
+    assert surviving.log is None

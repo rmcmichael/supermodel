@@ -105,9 +105,12 @@ def _column_for_annotation(annotation: Any) -> Column:
 class _FKDescriptor:
     """Lazy foreign-key attribute: stores parent id, resolves parent on access."""
 
-    def __init__(self, name: str, parent_cls: type[Model]) -> None:
+    def __init__(
+        self, name: str, parent_cls: type[Model], nullable: bool = False
+    ) -> None:
         self.name = name
         self.parent_cls = parent_cls
+        self.nullable = nullable
         self._obj_attr = f"_{name}_obj"
 
     def __set_name__(self, owner: type[Model], name: str) -> None:
@@ -119,21 +122,29 @@ class _FKDescriptor:
             return self
         if hasattr(obj, self._obj_attr):
             return getattr(obj, self._obj_attr)
-        fk_id = obj._fk_ids.get(self.name)
-        if fk_id is None:
+        if self.name not in obj._fk_ids:
+            if self.nullable:
+                return None
             raise AttributeError(
                 f"{type(obj).__name__}.{self.name} has not been set"
             )
+        fk_id = obj._fk_ids[self.name]
+        if fk_id is None:
+            return None
         parent = self.parent_cls.get(fk_id)
         setattr(obj, self._obj_attr, parent)
         return parent
 
     def __set__(self, obj: Model, value: Any) -> None:
         if value is None:
-            raise ModelError(
-                f"{type(obj).__name__}.{self.name} requires a "
-                f"{self.parent_cls.__name__} instance (got None)"
-            )
+            if not self.nullable:
+                raise ModelError(
+                    f"{type(obj).__name__}.{self.name} requires a "
+                    f"{self.parent_cls.__name__} instance (got None)"
+                )
+            setattr(obj, self._obj_attr, None)
+            obj._fk_ids[self.name] = None
+            return
         if not isinstance(value, self.parent_cls):
             raise ModelError(
                 f"{type(obj).__name__}.{self.name} requires a "
@@ -201,8 +212,9 @@ class Model:
     Unsupported field types and a reserved ``id`` annotation raise
     :class:`ModelError` when the subclass is defined.
 
-    Model-typed attributes are foreign keys (required; no ``| None`` in v1).
-    ``list[ChildModel]`` attributes are virtual reverse relations (no column).
+    Model-typed attributes are foreign keys. Use ``Parent | None`` for a
+    nullable FK. ``list[ChildModel]`` attributes are virtual reverse
+    relations (no column).
 
     Identity uses a read-only ``id`` property backed by private ``_id``.
     ``save()`` inserts (assigning a UUIDv7) when ``id is None``, otherwise
@@ -324,14 +336,9 @@ class Model:
             return
 
         if _is_model_type(inner):
-            if nullable:
-                raise ModelError(
-                    f"{cls.__name__}.{name}: optional foreign keys "
-                    f"(Model | None) are not supported yet; use {inner.__name__}"
-                )
             cls._fk_attrs[name] = inner
-            cls._columns[name] = FKColumn(nullable=False)
-            setattr(cls, name, _FKDescriptor(name, inner))
+            cls._columns[name] = FKColumn(nullable=nullable)
+            setattr(cls, name, _FKDescriptor(name, inner, nullable=nullable))
             return
 
         cls._columns[name] = _column_for_annotation(annotation)
@@ -481,7 +488,10 @@ class Model:
 
         If ``id is None``, generates a UUIDv7, inserts, and sets ``_id``.
         Otherwise updates the row for the current ``id``. Required foreign
-        keys must reference a parent that already has an ``id``.
+        keys must be set and must reference a parent that already has an
+        ``id``. Optional foreign keys (``Parent | None``) may be unset or
+        ``None`` (stored as ``NULL``); an assigned parent must still have
+        an ``id``.
 
         Does not cascade: only this instance is written. Related parents
         and children are not saved.
@@ -501,16 +511,19 @@ class Model:
     def _validate_foreign_keys(self) -> None:
         for attr in type(self)._fk_attrs:
             parent_id = self._fk_sql_id(attr)
-            if parent_id is None:
-                obj = getattr(self, f"_{attr}_obj", None)
-                if obj is None and attr not in self._fk_ids:
-                    raise ModelError(
-                        f"{type(self).__name__}.{attr} must be set before save()"
-                    )
+            if parent_id is not None:
+                continue
+            obj = getattr(self, f"_{attr}_obj", None)
+            if obj is not None:
                 raise ModelError(
                     f"{type(self).__name__}.{attr} parent must be saved "
                     f"(parent id is None) before save()"
                 )
+            if type(self)._columns[attr].nullable:
+                continue
+            raise ModelError(
+                f"{type(self).__name__}.{attr} must be set before save()"
+            )
 
     def _fk_sql_id(self, attr: str) -> str | None:
         obj = getattr(self, f"_{attr}_obj", None)
@@ -683,7 +696,8 @@ class Model:
 
         Only keys that match annotated model fields are applied. Scalar
         values must already be the correct Python types. Foreign keys
-        accept a parent id ``str`` or a parent model instance.
+        accept a parent id ``str`` or a parent model instance. Optional
+        foreign keys also accept ``None``.
 
         Args:
             values: Attribute name → value mapping.
@@ -697,7 +711,7 @@ class Model:
             value = values[attr]
             if attr in type(self)._fk_attrs:
                 parent_cls = type(self)._fk_attrs[attr]
-                if isinstance(value, parent_cls):
+                if value is None or isinstance(value, parent_cls):
                     setattr(self, attr, value)
                 elif isinstance(value, str):
                     self._fk_ids[attr] = value
@@ -717,7 +731,8 @@ class Model:
         """Return persisted attributes as a dict of Python values.
 
         Includes annotated model fields only (not ``id``). Foreign keys
-        are exported as parent id strings. Virtual collections are omitted.
+        are exported as parent id strings, or ``None`` when unset or
+        nullable and null. Virtual collections are omitted.
         Values are native Python types (``date``, ``time``, ``datetime``,
         ``bool``, etc.), not SQL encodings.
         """

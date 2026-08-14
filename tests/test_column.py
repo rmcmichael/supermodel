@@ -9,6 +9,7 @@ import pytest
 from supermodel.column import BoolColumn
 from supermodel.column import DateColumn
 from supermodel.column import DateTimeColumn
+from supermodel.column import FKColumn
 from supermodel.column import FloatColumn
 from supermodel.column import IntColumn
 from supermodel.column import TextColumn
@@ -35,6 +36,8 @@ from supermodel.column import TimeColumn
         (BoolColumn(nullable=True), "INTEGER DEFAULT NULL"),
         (TextColumn(), 'TEXT NOT NULL DEFAULT ""'),
         (TextColumn(nullable=True), "TEXT DEFAULT NULL"),
+        (FKColumn(), 'TEXT NOT NULL DEFAULT ""'),
+        (FKColumn(nullable=True), "TEXT DEFAULT NULL"),
     ],
 )
 def test_column_ddl(column, expected_ddl):
@@ -159,6 +162,7 @@ def test_datetime_column_from_sql_coerces_naive_string():
         FloatColumn(),
         BoolColumn(),
         TextColumn(),
+        FKColumn(),
         DateColumn(),
         TimeColumn(),
         DateTimeColumn(),
@@ -178,6 +182,7 @@ def test_non_nullable_rejects_none(column):
         FloatColumn(nullable=True),
         BoolColumn(nullable=True),
         TextColumn(nullable=True),
+        FKColumn(nullable=True),
         DateColumn(nullable=True),
         TimeColumn(nullable=True),
         DateTimeColumn(nullable=True),
